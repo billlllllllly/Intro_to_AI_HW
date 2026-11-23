@@ -15,7 +15,12 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import StratifiedGroupKFold
 from torch import nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from transformers import AutoTokenizer, BertModel, get_linear_schedule_with_warmup
+from transformers import (
+    AutoTokenizer,
+    BertModel,
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,7 +29,7 @@ COMPANY_TOKEN = "[CPY]"
 GMAIL_TOKEN = "[GMAIL]"
 LABELS = ("negative", "neutral", "positive")
 LABEL_TO_ID = {label: index for index, label in enumerate(LABELS)}
-DEFAULT_MODEL = ("mlp", 1e-5, 5e-4)
+DEFAULT_MODEL = ("mlp", 1e-5, 5e-4, "linear")
 
 
 def preprocess(text, clean=False, url_token=False):
@@ -184,6 +189,8 @@ def main():
                         const="ensemble", help="Compare ensembles using the supplied training settings.")
     experiment_modes.add_argument("--head-grid", dest="experiment", action="store_const",
                                   const="head-grid", help="Tune MLP learning rates and compare a CNN head.")
+    experiment_modes.add_argument("--improve-ensemble", dest="experiment", action="store_const",
+                                  const="improve-ensemble", help="Compare specialist and mixed ensembles.")
     parser.add_argument("--checkpoint-dir", type=Path, help="Reuse completed models from this directory.")
     parser.add_argument("--epochs", type=int, default=5, help="Maximum number of epochs.")
     parser.add_argument("--patience", type=int, default=2, help="Stop after this many epochs without a new best validation macro-F1.")
@@ -231,7 +238,9 @@ def _run(*, epochs, patience, class_weighting, fgsm_epsilon, batch_size,
     if set(data["label"]) != set(LABELS):
         raise ValueError(f"Expected exactly these sentiment labels: {LABELS}")
 
-    groups = data["text"].map(lambda text: preprocess(text, clean=experiment).casefold())
+    # Match the original specialist baseline split when comparing new ensembles.
+    clean_groups = experiment in (True, "ensemble", "head-grid")
+    groups = data["text"].map(lambda text: preprocess(text, clean=clean_groups).casefold())
     outer_split = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
     train_ids, held_out_ids = next(outer_split.split(data, data["label"], groups))
     train, held_out = data.iloc[train_ids], data.iloc[held_out_ids]
@@ -261,7 +270,7 @@ def _run(*, epochs, patience, class_weighting, fgsm_epsilon, batch_size,
 
     def fit(config, model_seed, specialist=None, final=False, model_options=DEFAULT_MODEL):
         weighting, balanced, clean, url_token, epsilon = config
-        head_type, encoder_lr, head_lr = model_options
+        head_type, encoder_lr, head_lr, schedule = model_options
         key = (config, model_seed, specialist, model_options)
         if not final and key in validation_cache:
             return validation_cache[key]
@@ -304,11 +313,11 @@ def _run(*, epochs, patience, class_weighting, fgsm_epsilon, batch_size,
         if specialist is not None:
             weights[LABEL_TO_ID[specialist]] *= 2
         print(f"Training {head_type.upper()} head | encoder LR {encoder_lr:g} | head LR {head_lr:g} | "
-              f"settings {config} | seed {model_seed} | specialist {specialist}", flush=True)
+              f"schedule {schedule} | settings {config} | seed {model_seed} | specialist {specialist}", flush=True)
         model, history = train_model(tokenizer, train_loader, val_loader, device,
                                      nn.CrossEntropyLoss(), weights, epochs=epochs,
                                      patience=patience, fgsm_epsilon=epsilon, head_type=head_type,
-                                     encoder_lr=encoder_lr, head_lr=head_lr)
+                                     encoder_lr=encoder_lr, head_lr=head_lr, schedule=schedule)
         val = predict_probabilities(model, val_loader, device)
         if checkpoint is not None:
             saved = {"model": {name: tensor.cpu() for name, tensor in model.state_dict().items()},
@@ -348,19 +357,20 @@ def _run(*, epochs, patience, class_weighting, fgsm_epsilon, batch_size,
         config = select([config, (*config[:4], 0.001), (*config[:4], 0.003)])
 
     model_options = DEFAULT_MODEL
+    voting = "soft"
     if experiment == "head-grid":
         def score_head(options):
             return validation_score(fit(config, seed, model_options=options))
 
         # Use the same split and learning rates for the final MLP/CNN comparison.
-        mlp_options = [("mlp", encoder_lr, head_lr)
+        mlp_options = [("mlp", encoder_lr, head_lr, "linear")
                        for encoder_lr, head_lr in product((1e-5, 2e-5), (5e-4, 1e-4))]
         best_mlp = max(mlp_options, key=score_head)
         cnn_options = ("cnn", *best_mlp[1:])
         model_options = max((best_mlp, cnn_options), key=score_head)
         members = [(seed, None)]
         print(f"Selected head and learning rates {model_options}", flush=True)
-    elif experiment:
+    elif experiment and experiment != "improve-ensemble":
         candidates = [[(seed, None)]]
         if ensemble:
             candidates.append([(seed + i, None) for i in range(3)])
@@ -373,14 +383,42 @@ def _run(*, epochs, patience, class_weighting, fgsm_epsilon, batch_size,
         members = max(candidates, key=ensemble_score)
         print(f"Selected configuration {config} and members {members}", flush=True)
 
-    results = [fit(config, n, label, final=True, model_options=model_options)
-               for n, label in members]
-    single_name = "bert_cnn" if model_options[0] == "cnn" else "bert"
-    histories = {(label or (single_name if len(members) == 1 else f"bert_seed_{n}")): result[3]
-                 for (n, label), result in zip(members, results)}
+    selected = [(config, n, label, model_options) for n, label in members]
+    if experiment == "improve-ensemble":
+        specialists = [(config, seed + i, label, DEFAULT_MODEL) for i, label in enumerate(LABELS)]
+        fgsm = ((*config[:4], 0.001), seed, None, DEFAULT_MODEL)
+        cosine = (config, seed + 1, None, (*DEFAULT_MODEL[:3], "cosine"))
+        candidates = [
+            ("original specialists", specialists),
+            ("specialists with FGSM", [fgsm, *specialists[1:]]),
+            ("specialists with cosine", [*specialists[:2], cosine]),
+            ("neutral specialist with FGSM and cosine", [specialists[1], fgsm, cosine]),
+        ]
+        best_score = -1.0
+        for name, candidate in candidates:
+            probabilities = [fit(settings, model_seed, label, model_options=options)
+                             for settings, model_seed, label, options in candidate]
+            for method in ("soft", "hard"):
+                scores = vote(probabilities, method)
+                score = f1_score(targets, scores.argmax(dim=1).tolist(),
+                                 labels=list(range(len(LABELS))), average="macro", zero_division=0)
+                print(f"{name} | {method} voting | validation macro-F1 {score:.4f}", flush=True)
+                if score > best_score:
+                    best_score, selected, voting = score, candidate, method
+        print(f"Selected {voting} voting with {selected}", flush=True)
+
+    results = [fit(settings, n, label, final=True, model_options=options)
+               for settings, n, label, options in selected]
+    histories = {}
+    for (_, n, label, options), result in zip(selected, results):
+        name = label or (f"bert_{options[0]}_seed_{n}" if len(selected) > 1
+                         else "bert_cnn" if options[0] == "cnn" else "bert")
+        histories[name] = result[3]
     validation_probs, test_probs, benchmark_probs = (
-        torch.stack([result[i] for result in results]).mean(0) for i in range(3)
+        vote([result[i] for result in results], voting) for i in range(3)
     )
+    if experiment == "improve-ensemble":
+        validation_score(validation_probs)
     for name, frame, scores in (
         ("Validation", validation, validation_probs), ("Held-out test", test, test_probs)
     ):
@@ -396,8 +434,17 @@ def _run(*, epochs, patience, class_weighting, fgsm_epsilon, batch_size,
     return predictions, histories
 
 
+def vote(probabilities, method):
+    members = torch.stack(probabilities)
+    average = members.mean(dim=0)
+    if method == "hard":
+        counts = nn.functional.one_hot(members.argmax(dim=2), num_classes=len(LABELS)).sum(dim=0)
+        average = average.masked_fill(counts != counts.amax(dim=1, keepdim=True), -torch.inf)
+    return average
+
+
 def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weights,
-                *, epochs, patience, fgsm_epsilon, head_type, encoder_lr, head_lr):
+                *, epochs, patience, fgsm_epsilon, head_type, encoder_lr, head_lr, schedule):
     model = SentimentModel(len(tokenizer), head_type=head_type).to(device)
     optimizer = torch.optim.AdamW(
         [
@@ -407,7 +454,9 @@ def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weig
         weight_decay=0.01,
     )
     total_steps = epochs * len(train_loader)
-    scheduler = get_linear_schedule_with_warmup(
+    make_scheduler = (get_cosine_schedule_with_warmup if schedule == "cosine"
+                      else get_linear_schedule_with_warmup)
+    scheduler = make_scheduler(
         optimizer, num_warmup_steps=round(0.1 * total_steps), num_training_steps=total_steps,
     )
 
