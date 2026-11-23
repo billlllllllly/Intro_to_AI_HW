@@ -1,13 +1,14 @@
 """Train a three-class sentiment classifier on the HW3 labeled dataset."""
 
 import argparse
+import html
 from pathlib import Path
 import re
 
 import emoji
 import pandas as pd
 import torch
-from sklearn.metrics import f1_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import StratifiedGroupKFold
 from torch import nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -22,8 +23,12 @@ LABELS = ("negative", "neutral", "positive")
 LABEL_TO_ID = {label: index for index, label in enumerate(LABELS)}
 
 
-def preprocess(text):
-    text = re.sub(r"(?:https?://|www\.)\S+", " ", text, flags=re.IGNORECASE)
+def preprocess(text, clean=False, url_token=False):
+    if clean:
+        text = html.unescape(text)
+        text = re.sub(r"Cancelled Flight(?:led|ed)", "cancelled", text, flags=re.I)
+        text = re.sub(r"Late Flightr\b", "later", text, flags=re.I)
+    text = re.sub(r"(?:https?://|www\.)\S+", " [URL] " if url_token else " ", text, flags=re.IGNORECASE)
     text = re.sub(r"[\w.+%\-]+@gmail\.com(?![\w-]|\.[\w-])",
                   f" {GMAIL_TOKEN} ", text, flags=re.IGNORECASE)
     text = re.sub(r"(?<!\w)@\w+", f" {COMPANY_TOKEN} ", text)
@@ -61,14 +66,14 @@ class SentimentModel(nn.Module):
         return self.head(hidden[:, 0])
 
 
-def make_loader(frame, tokenizer, batch_size, max_length, shuffle=False, sampler=None):
+def make_loader(frame, tokenizer, batch_size, max_length, shuffle=False, sampler=None, clean=False, url_token=False):
     labels = frame["label"].map(LABEL_TO_ID) if "label" in frame else [-1] * len(frame)
     examples = list(zip(frame["text"], labels))
 
     def collate(batch):
         texts, labels = zip(*batch)
         inputs = tokenizer(
-            [preprocess(text) for text in texts],
+            [preprocess(text, clean, url_token) for text in texts],
             padding=True,
             truncation=True,
             max_length=max_length,
@@ -140,6 +145,7 @@ def predict_probabilities(model, loader, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--experiment", action="store_true", help="Select preprocessing, weighting, FGSM and ensemble on validation data.")
     parser.add_argument("--epochs", type=int, default=5, help="Maximum number of epochs.")
     parser.add_argument("--patience", type=int, default=2, help="Stop after this many epochs without a new best validation macro-F1.")
     parser.add_argument("--class-weighting", choices=("sqrt", "inverse", "none"), default="sqrt",
@@ -155,7 +161,7 @@ def main():
 
 
 def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
-        batch_size=16, balanced_sampling=False, ensemble=False, max_length=128):
+        batch_size=16, balanced_sampling=False, ensemble=False, max_length=128, experiment=False):
     """Train BERT and return benchmark predictions and training histories in memory."""
     if not 0 <= fgsm_epsilon < float("inf"):
         raise ValueError("FGSM epsilon must be finite and nonnegative.")
@@ -173,7 +179,7 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     if set(data["label"]) != set(LABELS):
         raise ValueError(f"Expected exactly these sentiment labels: {LABELS}")
 
-    groups = data["text"].map(lambda text: preprocess(text).casefold())
+    groups = data["text"].map(lambda text: preprocess(text, clean=experiment).casefold())
     outer_split = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
     train_ids, held_out_ids = next(outer_split.split(data, data["label"], groups))
     train, held_out = data.iloc[train_ids], data.iloc[held_out_ids]
@@ -190,51 +196,81 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     print(f"Removed nearly empty training posts by class: {removed.to_dict()}")
     print(f"Device: {device} | train: {len(train)} | validation: {len(validation)} | test: {len(test)}", flush=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
-    tokenizer.add_special_tokens({"additional_special_tokens": [COMPANY_TOKEN, GMAIL_TOKEN]})
-    counts = train["label"].value_counts().reindex(LABELS)
-    sampler = None
-    if balanced_sampling:
-        sample_weights = train["label"].map(1.0 / counts).to_numpy()
-        sampler = WeightedRandomSampler(sample_weights, len(train), replacement=True)
-    train_loader = make_loader(train, tokenizer, batch_size, max_length,
-                               shuffle=True, sampler=sampler)
-    val_loader = make_loader(validation, tokenizer, batch_size, max_length)
-    test_loader = make_loader(test, tokenizer, batch_size, max_length)
-    loss_fn = nn.CrossEntropyLoss()
-    print(f"Training label counts: {counts.to_dict()} | class weighting: {class_weighting}"
-          f" | balanced sampling: {balanced_sampling}")
-    class_weights = None
-    if class_weighting != "none":
-        class_weights = torch.tensor(len(train) / (len(LABELS) * counts.to_numpy()),
-                                     dtype=torch.float32, device=device)
-        if class_weighting == "sqrt":
-            class_weights = class_weights.sqrt()
-
     benchmark = pd.read_csv(ROOT / "dataset" / "benchmark.csv", keep_default_na=False)
-    benchmark_loader = make_loader(benchmark, tokenizer, batch_size, max_length)
-    loaders = (val_loader, test_loader, benchmark_loader)
-    probabilities = [[], [], []]
-    histories = {}
-    for index, label in enumerate(LABELS if ensemble else (None,)):
-        torch.manual_seed(seed + index)
-        weights = class_weights
-        if label is not None:
-            weights = torch.ones(len(LABELS), device=device) if weights is None else weights.clone()
-            weights[LABEL_TO_ID[label]] *= 2
-            print(f"Training {label} specialist with loss weights {dict(zip(LABELS, weights.tolist()))}")
-        model, history = train_model(
-            tokenizer, train_loader, val_loader, device, loss_fn, weights,
-            epochs=epochs, patience=patience, fgsm_epsilon=fgsm_epsilon,
-        )
-        histories[label or "bert"] = history
-        for loader, predictions in zip(loaders, probabilities):
-            predictions.append(predict_probabilities(model, loader, device))
-        del model
+    targets = validation["label"].map(LABEL_TO_ID).tolist()
+    counts = train["label"].value_counts().reindex(LABELS)
+    cache = {}
 
-    # Each specialist already emphasizes its target class during training.
+    def fit(config, model_seed, specialist=None, final=False):
+        weighting, balanced, clean, url_token, epsilon = config
+        key = (config, model_seed, specialist)
+        if not final and key in cache:
+            return cache[key]
+        torch.manual_seed(model_seed)
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+        tokens = [COMPANY_TOKEN, GMAIL_TOKEN] + (["[URL]"] if url_token else [])
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+        options = dict(tokenizer=tokenizer, batch_size=batch_size, max_length=max_length,
+                       clean=clean, url_token=url_token)
+        sampler = None
+        if balanced:
+            sampler = WeightedRandomSampler(train["label"].map(1 / counts).to_numpy(),
+                                            len(train), replacement=True)
+        train_loader = make_loader(train, **options, shuffle=True, sampler=sampler)
+        val_loader = make_loader(validation, **options)
+        weights = torch.ones(len(LABELS), device=device)
+        if weighting != "none":
+            weights = torch.tensor(len(train) / (len(LABELS) * counts.to_numpy()),
+                                   dtype=torch.float32, device=device)
+            if weighting == "sqrt":
+                weights = weights.sqrt()
+        if specialist is not None:
+            weights[LABEL_TO_ID[specialist]] *= 2
+        print(f"Training {config}, seed {model_seed}, specialist {specialist}", flush=True)
+        model, history = train_model(tokenizer, train_loader, val_loader, device,
+                                     nn.CrossEntropyLoss(), weights, epochs=epochs,
+                                     patience=patience, fgsm_epsilon=epsilon)
+        val = predict_probabilities(model, val_loader, device)
+        if final:
+            return (val, predict_probabilities(model, make_loader(test, **options), device),
+                    predict_probabilities(model, make_loader(benchmark, **options), device), history)
+        cache[key] = val
+        return val
+
+    def validation_score(probs):
+        predicted = probs.argmax(dim=1).tolist()
+        score = f1_score(targets, predicted, average="macro", labels=[0, 1, 2], zero_division=0)
+        print(classification_report(targets, predicted, labels=[0, 1, 2], target_names=LABELS,
+                                    digits=4, zero_division=0))
+        print(confusion_matrix(targets, predicted, labels=[0, 1, 2]))
+        return score
+
+    config = (class_weighting, balanced_sampling, False, False, fgsm_epsilon)
+    members = [(seed + i, label) for i, label in enumerate(LABELS)] if ensemble else [(seed, None)]
+    if experiment:
+        def select(candidates):
+            return max(candidates, key=lambda c: validation_score(fit(c, seed)))
+
+        config = select([(w, b, False, False, 0.0) for w, b in
+                         [("sqrt", False), ("inverse", False), ("none", True)]])
+        config = select([config, (*config[:2], True, False, 0.0)])
+        config = select([config, (*config[:3], True, 0.0)])
+        config = select([config, (*config[:4], 0.001), (*config[:4], 0.003)])
+        candidates = [[(seed, None)]]
+        if ensemble:
+            candidates.extend([[(seed + i, None) for i in range(3)], members])
+
+        def ensemble_score(group):
+            return validation_score(torch.stack([fit(config, n, label) for n, label in group]).mean(0))
+
+        members = max(candidates, key=ensemble_score)
+        print(f"Selected configuration {config} and members {members}", flush=True)
+
+    results = [fit(config, n, label, final=True) for n, label in members]
+    histories = {(label or ("bert" if len(members) == 1 else f"bert_seed_{n}")): result[3]
+                 for (n, label), result in zip(members, results)}
     validation_probs, test_probs, benchmark_probs = (
-        torch.stack(predictions).mean(dim=0) for predictions in probabilities
+        torch.stack([result[i] for result in results]).mean(0) for i in range(3)
     )
     for name, frame, scores in (
         ("Validation", validation, validation_probs), ("Held-out test", test, test_probs)
