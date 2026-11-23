@@ -1,9 +1,12 @@
 """Train a three-class sentiment classifier on the HW3 labeled dataset."""
 
 import argparse
+import hashlib
 import html
+from itertools import product
 from pathlib import Path
 import re
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 import emoji
 import pandas as pd
@@ -21,6 +24,7 @@ COMPANY_TOKEN = "[CPY]"
 GMAIL_TOKEN = "[GMAIL]"
 LABELS = ("negative", "neutral", "positive")
 LABEL_TO_ID = {label: index for index, label in enumerate(LABELS)}
+DEFAULT_MODEL = ("mlp", 1e-5, 5e-4)
 
 
 def preprocess(text, clean=False, url_token=False):
@@ -43,11 +47,38 @@ def has_content(text):
     return any(character.isalnum() for character in cleaned)
 
 
+class CNNHead(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.widths = (2, 3, 4)
+        channels = 64
+        self.convolutions = nn.ModuleList(
+            nn.Conv1d(hidden_size, channels, width) for width in self.widths
+        )
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Linear(channels * len(self.widths), len(LABELS))
+
+    def forward(self, hidden, attention_mask):
+        padding = max(0, max(self.widths) - hidden.size(1))
+        tokens = nn.functional.pad(hidden.transpose(1, 2), (0, padding))
+        mask = nn.functional.pad(attention_mask.bool(), (0, padding), value=False)
+        features = []
+        for width, convolution in zip(self.widths, self.convolutions):
+            activations = convolution(tokens).relu()
+            valid = mask.unfold(1, width, 1).all(dim=-1).unsqueeze(1)
+            pooled = activations.masked_fill(~valid, 0).amax(dim=-1)
+            features.append(pooled)
+        return self.classifier(self.dropout(torch.cat(features, dim=1)))
+
+
 class SentimentModel(nn.Module):
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size, head_type="mlp"):
         super().__init__()
         self.encoder = BertModel.from_pretrained(BASE_MODEL, add_pooling_layer=False)
         self.encoder.resize_token_embeddings(vocab_size)
+        if head_type == "cnn":
+            self.head = CNNHead(self.encoder.config.hidden_size)
+            return
         self.head = nn.Sequential(
             nn.Linear(self.encoder.config.hidden_size, 128),
             nn.ReLU(),
@@ -63,6 +94,8 @@ class SentimentModel(nn.Module):
             inputs = {name: tensor for name, tensor in inputs.items() if name != "input_ids"}
             inputs["inputs_embeds"] = embeddings
         hidden = self.encoder(**inputs).last_hidden_state
+        if isinstance(self.head, CNNHead):
+            return self.head(hidden, inputs["attention_mask"])
         return self.head(hidden[:, 0])
 
 
@@ -145,7 +178,13 @@ def predict_probabilities(model, loader, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment", action="store_true", help="Select preprocessing, weighting, FGSM and ensemble on validation data.")
+    experiment_modes = parser.add_mutually_exclusive_group()
+    experiment_modes.add_argument("--experiment", action="store_true", help="Select preprocessing, weighting, FGSM and ensemble on validation data.")
+    experiment_modes.add_argument("--ensemble-experiment", dest="experiment", action="store_const",
+                        const="ensemble", help="Compare ensembles using the supplied training settings.")
+    experiment_modes.add_argument("--head-grid", dest="experiment", action="store_const",
+                                  const="head-grid", help="Tune MLP learning rates and compare a CNN head.")
+    parser.add_argument("--checkpoint-dir", type=Path, help="Reuse completed models from this directory.")
     parser.add_argument("--epochs", type=int, default=5, help="Maximum number of epochs.")
     parser.add_argument("--patience", type=int, default=2, help="Stop after this many epochs without a new best validation macro-F1.")
     parser.add_argument("--class-weighting", choices=("sqrt", "inverse", "none"), default="sqrt",
@@ -161,8 +200,21 @@ def main():
 
 
 def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
-        batch_size=16, balanced_sampling=False, ensemble=False, max_length=128, experiment=False):
+        batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
+        experiment=False, checkpoint_dir=None):
     """Train BERT and return benchmark predictions and training histories in memory."""
+    options = dict(epochs=epochs, patience=patience, class_weighting=class_weighting,
+                   fgsm_epsilon=fgsm_epsilon, batch_size=batch_size,
+                   balanced_sampling=balanced_sampling, ensemble=ensemble,
+                   max_length=max_length, experiment=experiment)
+    if checkpoint_dir is not None:
+        return _run(**options, checkpoint_dir=Path(checkpoint_dir))
+    with TemporaryDirectory(prefix="hw3-models-") as directory:
+        return _run(**options, checkpoint_dir=Path(directory) if experiment else None)
+
+
+def _run(*, epochs, patience, class_weighting, fgsm_epsilon, batch_size,
+         balanced_sampling, ensemble, max_length, experiment, checkpoint_dir):
     if not 0 <= fgsm_epsilon < float("inf"):
         raise ValueError("FGSM epsilon must be finite and nonnegative.")
     if patience < 1:
@@ -199,25 +251,50 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     benchmark = pd.read_csv(ROOT / "dataset" / "benchmark.csv", keep_default_na=False)
     targets = validation["label"].map(LABEL_TO_ID).tolist()
     counts = train["label"].value_counts().reindex(LABELS)
-    cache = {}
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    fingerprint = hashlib.sha256(Path(__file__).read_bytes())
+    fingerprint.update((ROOT / "dataset" / "dataset.csv").read_bytes())
+    fingerprint.update(repr((epochs, patience, batch_size, max_length, str(device),
+                             train.index.tolist(), validation.index.tolist())).encode())
+    validation_cache = {}
 
-    def fit(config, model_seed, specialist=None, final=False):
+    def fit(config, model_seed, specialist=None, final=False, model_options=DEFAULT_MODEL):
         weighting, balanced, clean, url_token, epsilon = config
-        key = (config, model_seed, specialist)
-        if not final and key in cache:
-            return cache[key]
+        head_type, encoder_lr, head_lr = model_options
+        key = (config, model_seed, specialist, model_options)
+        if not final and key in validation_cache:
+            return validation_cache[key]
+        digest = fingerprint.copy()
+        digest.update(repr(key).encode())
+        checkpoint = None if checkpoint_dir is None else checkpoint_dir / (digest.hexdigest() + ".pt")
         torch.manual_seed(model_seed)
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
         tokens = [COMPANY_TOKEN, GMAIL_TOKEN] + (["[URL]"] if url_token else [])
         tokenizer.add_special_tokens({"additional_special_tokens": tokens})
         options = dict(tokenizer=tokenizer, batch_size=batch_size, max_length=max_length,
                        clean=clean, url_token=url_token)
+        val_loader = make_loader(validation, **options)
+        if checkpoint is not None and checkpoint.is_file():
+            print(f"Reusing checkpoint for {model_options}, settings {config}, "
+                  f"seed {model_seed}, specialist {specialist}", flush=True)
+            saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            if not final:
+                validation_cache[key] = saved["validation"]
+                return saved["validation"]
+            model = SentimentModel(len(tokenizer), head_type=head_type)
+            model.load_state_dict(saved["model"])
+            model.to(device)
+            return (saved["validation"],
+                    predict_probabilities(model, make_loader(test, **options), device),
+                    predict_probabilities(model, make_loader(benchmark, **options), device),
+                    saved["history"])
+
         sampler = None
         if balanced:
             sampler = WeightedRandomSampler(train["label"].map(1 / counts).to_numpy(),
                                             len(train), replacement=True)
         train_loader = make_loader(train, **options, shuffle=True, sampler=sampler)
-        val_loader = make_loader(validation, **options)
         weights = torch.ones(len(LABELS), device=device)
         if weighting != "none":
             weights = torch.tensor(len(train) / (len(LABELS) * counts.to_numpy()),
@@ -226,15 +303,27 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
                 weights = weights.sqrt()
         if specialist is not None:
             weights[LABEL_TO_ID[specialist]] *= 2
-        print(f"Training {config}, seed {model_seed}, specialist {specialist}", flush=True)
+        print(f"Training {head_type.upper()} head | encoder LR {encoder_lr:g} | head LR {head_lr:g} | "
+              f"settings {config} | seed {model_seed} | specialist {specialist}", flush=True)
         model, history = train_model(tokenizer, train_loader, val_loader, device,
                                      nn.CrossEntropyLoss(), weights, epochs=epochs,
-                                     patience=patience, fgsm_epsilon=epsilon)
+                                     patience=patience, fgsm_epsilon=epsilon, head_type=head_type,
+                                     encoder_lr=encoder_lr, head_lr=head_lr)
         val = predict_probabilities(model, val_loader, device)
+        if checkpoint is not None:
+            saved = {"model": {name: tensor.cpu() for name, tensor in model.state_dict().items()},
+                     "validation": val, "history": history}
+            with NamedTemporaryFile(dir=checkpoint_dir, suffix=".tmp", delete=False) as file:
+                temporary = Path(file.name)
+            try:
+                torch.save(saved, temporary)
+                temporary.replace(checkpoint)
+            finally:
+                temporary.unlink(missing_ok=True)
         if final:
             return (val, predict_probabilities(model, make_loader(test, **options), device),
                     predict_probabilities(model, make_loader(benchmark, **options), device), history)
-        cache[key] = val
+        validation_cache[key] = val
         return val
 
     def validation_score(probs):
@@ -243,11 +332,12 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         print(classification_report(targets, predicted, labels=[0, 1, 2], target_names=LABELS,
                                     digits=4, zero_division=0))
         print(confusion_matrix(targets, predicted, labels=[0, 1, 2]))
+        print(f"Candidate validation macro-F1 {score:.4f}", flush=True)
         return score
 
     config = (class_weighting, balanced_sampling, False, False, fgsm_epsilon)
     members = [(seed + i, label) for i, label in enumerate(LABELS)] if ensemble else [(seed, None)]
-    if experiment:
+    if experiment is True:
         def select(candidates):
             return max(candidates, key=lambda c: validation_score(fit(c, seed)))
 
@@ -256,9 +346,26 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         config = select([config, (*config[:2], True, False, 0.0)])
         config = select([config, (*config[:3], True, 0.0)])
         config = select([config, (*config[:4], 0.001), (*config[:4], 0.003)])
+
+    model_options = DEFAULT_MODEL
+    if experiment == "head-grid":
+        def score_head(options):
+            return validation_score(fit(config, seed, model_options=options))
+
+        # Use the same split and learning rates for the final MLP/CNN comparison.
+        mlp_options = [("mlp", encoder_lr, head_lr)
+                       for encoder_lr, head_lr in product((1e-5, 2e-5), (5e-4, 1e-4))]
+        best_mlp = max(mlp_options, key=score_head)
+        cnn_options = ("cnn", *best_mlp[1:])
+        model_options = max((best_mlp, cnn_options), key=score_head)
+        members = [(seed, None)]
+        print(f"Selected head and learning rates {model_options}", flush=True)
+    elif experiment:
         candidates = [[(seed, None)]]
         if ensemble:
-            candidates.extend([[(seed + i, None) for i in range(3)], members])
+            candidates.append([(seed + i, None) for i in range(3)])
+            if experiment is True:
+                candidates.append(members)
 
         def ensemble_score(group):
             return validation_score(torch.stack([fit(config, n, label) for n, label in group]).mean(0))
@@ -266,8 +373,10 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         members = max(candidates, key=ensemble_score)
         print(f"Selected configuration {config} and members {members}", flush=True)
 
-    results = [fit(config, n, label, final=True) for n, label in members]
-    histories = {(label or ("bert" if len(members) == 1 else f"bert_seed_{n}")): result[3]
+    results = [fit(config, n, label, final=True, model_options=model_options)
+               for n, label in members]
+    single_name = "bert_cnn" if model_options[0] == "cnn" else "bert"
+    histories = {(label or (single_name if len(members) == 1 else f"bert_seed_{n}")): result[3]
                  for (n, label), result in zip(members, results)}
     validation_probs, test_probs, benchmark_probs = (
         torch.stack([result[i] for result in results]).mean(0) for i in range(3)
@@ -288,12 +397,12 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
 
 
 def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weights,
-                *, epochs, patience, fgsm_epsilon):
-    model = SentimentModel(len(tokenizer)).to(device)
+                *, epochs, patience, fgsm_epsilon, head_type, encoder_lr, head_lr):
+    model = SentimentModel(len(tokenizer), head_type=head_type).to(device)
     optimizer = torch.optim.AdamW(
         [
-            {"params": model.encoder.parameters(), "lr": 1e-5},
-            {"params": model.head.parameters(), "lr": 5e-4},
+            {"params": model.encoder.parameters(), "lr": encoder_lr},
+            {"params": model.head.parameters(), "lr": head_lr},
         ],
         weight_decay=0.01,
     )
