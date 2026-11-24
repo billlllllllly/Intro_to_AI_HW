@@ -3,13 +3,11 @@
 import argparse
 from dataclasses import dataclass
 import hashlib
-import html
 from pathlib import Path
-import re
 import subprocess
 from tempfile import NamedTemporaryFile
 
-import emoji
+from sentiment_preprocessing import COMPANY_TOKEN, GMAIL_TOKEN, preprocess
 import pandas as pd
 import torch
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
@@ -26,34 +24,10 @@ from transformers import (
 
 ROOT = Path(__file__).resolve().parent
 BASE_MODEL = "google-bert/bert-base-uncased"
-COMPANY_TOKEN = "[CPY]"
-GMAIL_TOKEN = "[GMAIL]"
 LABELS = ("negative", "neutral", "positive")
 LABEL_TO_ID = {label: index for index, label in enumerate(LABELS)}
 ENCODER_LR = 1e-5
 HEAD_LR = 5e-4
-
-
-def preprocess(text, clean=False, url_token=False, distinguish_mentions=False):
-    if clean:
-        text = html.unescape(text)
-        text = re.sub(r"Cancelled Flight(?:led|ed)", "cancelled", text, flags=re.I)
-        text = re.sub(r"Late Flightr\b", "later", text, flags=re.I)
-    text = re.sub(r"(?:https?://|www\.)\S+", " [URL] " if url_token else " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"[\w.+%\-]+@gmail\.com(?![\w-]|\.[\w-])",
-                  f" {GMAIL_TOKEN} ", text, flags=re.IGNORECASE)
-    mentions = r"(?<!\w)@\w+"
-    first = re.search(mentions, text) if distinguish_mentions else None
-    if first:
-        addressed = first.group().casefold()
-        text = re.sub(mentions, lambda m: " [CPY] " if m.group().casefold() == addressed
-                      else " [OTHER_USER] ", text)
-    else:
-        text = re.sub(mentions, f" {COMPANY_TOKEN} ", text)
-    text = emoji.replace_emoji(
-        text, replace=lambda symbol, data: " " + data["en"].strip(":").replace("_", " ") + " ",
-    )
-    return " ".join(text.split())
 
 
 def has_content(text):
