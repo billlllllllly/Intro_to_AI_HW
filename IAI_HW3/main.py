@@ -5,6 +5,7 @@ import hashlib
 import html
 from pathlib import Path
 import re
+import subprocess
 from tempfile import NamedTemporaryFile
 
 import emoji
@@ -32,7 +33,7 @@ ENCODER_LR = 1e-5
 HEAD_LR = 5e-4
 
 
-def preprocess(text, clean=False, url_token=False):
+def preprocess(text, clean=False, url_token=False, distinguish_mentions=False):
     if clean:
         text = html.unescape(text)
         text = re.sub(r"Cancelled Flight(?:led|ed)", "cancelled", text, flags=re.I)
@@ -40,7 +41,14 @@ def preprocess(text, clean=False, url_token=False):
     text = re.sub(r"(?:https?://|www\.)\S+", " [URL] " if url_token else " ", text, flags=re.IGNORECASE)
     text = re.sub(r"[\w.+%\-]+@gmail\.com(?![\w-]|\.[\w-])",
                   f" {GMAIL_TOKEN} ", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?<!\w)@\w+", f" {COMPANY_TOKEN} ", text)
+    mentions = r"(?<!\w)@\w+"
+    first = re.search(mentions, text) if distinguish_mentions else None
+    if first:
+        addressed = first.group().casefold()
+        text = re.sub(mentions, lambda m: " [CPY] " if m.group().casefold() == addressed
+                      else " [OTHER_USER] ", text)
+    else:
+        text = re.sub(mentions, f" {COMPANY_TOKEN} ", text)
     text = emoji.replace_emoji(
         text, replace=lambda symbol, data: " " + data["en"].strip(":").replace("_", " ") + " ",
     )
@@ -104,14 +112,14 @@ class SentimentModel(nn.Module):
         return self.head(hidden[:, 0])
 
 
-def make_loader(frame, tokenizer, batch_size, max_length, shuffle=False, sampler=None, clean=False, url_token=False):
+def make_loader(frame, tokenizer, batch_size, max_length, shuffle=False, sampler=None, clean=False, url_token=False, distinguish_mentions=False):
     labels = frame["label"].map(LABEL_TO_ID) if "label" in frame else [-1] * len(frame)
     examples = list(zip(frame["text"], labels))
 
     def collate(batch):
         texts, labels = zip(*batch)
         inputs = tokenizer(
-            [preprocess(text, clean, url_token) for text in texts],
+            [preprocess(text, clean, url_token, distinguish_mentions) for text in texts],
             padding=True,
             truncation=True,
             max_length=max_length,
@@ -184,6 +192,8 @@ def predict_probabilities(model, loader, device):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-dir", type=Path, help="Reuse completed models from this directory.")
+    parser.add_argument("--distinguish-mentions", action="store_true")
+    parser.add_argument("--review-path", type=Path, help="Save validation neutral/negative disagreements here.")
     parser.add_argument("--epochs", type=int, default=5, help="Maximum number of epochs.")
     parser.add_argument("--patience", type=int, default=2, help="Stop after this many epochs without a new best validation macro-F1.")
     parser.add_argument("--class-weighting", choices=("sqrt", "inverse", "none"), default="sqrt",
@@ -202,7 +212,7 @@ def main():
 
 def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
-        checkpoint_dir=None, schedule="linear"):
+        checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None):
     """Train BERT and return benchmark predictions and training histories."""
     if schedule not in ("linear", "cosine"):
         raise ValueError("Schedule must be linear or cosine.")
@@ -246,20 +256,44 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     counts = train["label"].value_counts().reindex(LABELS)
     if checkpoint_dir is not None:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    fingerprint = hashlib.sha256(Path(__file__).read_bytes())
-    fingerprint.update((ROOT / "dataset" / "dataset.csv").read_bytes())
-    fingerprint.update(repr((epochs, patience, batch_size, max_length, str(device),
-                             train.index.tolist(), validation.index.tolist())).encode())
+    # The previous Colab version hashed the entire script into its filenames.
+    # Its training recipe is compatible only with the original mention handling.
+    sources = [Path(__file__).read_bytes()]
+    if checkpoint_dir and not distinguish_mentions and any(checkpoint_dir.glob("*.pt")):
+        try:
+            old = subprocess.run(["git", "cat-file", "blob", "236a5a13c653087e41a9e8a79f8fad60aa780546"],
+                                 cwd=ROOT, capture_output=True, check=True).stdout
+            sources.append(old)
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    data_bytes = (ROOT / "dataset" / "dataset.csv").read_bytes()
+    run_key = repr((epochs, patience, batch_size, max_length, str(device),
+                    train.index.tolist(), validation.index.tolist())).encode()
+    fingerprints = []
+    for source in sources:
+        digest = hashlib.sha256(source)
+        digest.update(data_bytes)
+        digest.update(run_key)
+        fingerprints.append(digest)
 
     def fit(model_seed, specialist, head_type):
         key = (class_weighting, balanced_sampling, fgsm_epsilon, model_seed, specialist, head_type, schedule)
-        digest = fingerprint.copy()
-        digest.update(repr(key).encode())
-        checkpoint = None if checkpoint_dir is None else checkpoint_dir / (digest.hexdigest() + ".pt")
+        if distinguish_mentions:
+            key += ("distinct_mentions",)
+        checkpoint = None
+        if checkpoint_dir is not None:
+            paths = []
+            for fingerprint in fingerprints:
+                digest = fingerprint.copy()
+                digest.update(repr(key).encode())
+                paths.append(checkpoint_dir / (digest.hexdigest() + ".pt"))
+            checkpoint = next((path for path in paths if path.is_file()), paths[0])
         torch.manual_seed(model_seed)
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
-        tokenizer.add_special_tokens({"additional_special_tokens": [COMPANY_TOKEN, GMAIL_TOKEN]})
-        options = dict(tokenizer=tokenizer, batch_size=batch_size, max_length=max_length)
+        tokens = [COMPANY_TOKEN, GMAIL_TOKEN] + (["[OTHER_USER]"] if distinguish_mentions else [])
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+        options = dict(tokenizer=tokenizer, batch_size=batch_size, max_length=max_length,
+                       distinguish_mentions=distinguish_mentions)
         val_loader = make_loader(validation, **options)
         if checkpoint is not None and checkpoint.is_file():
             print(f"Reusing {head_type.upper()} checkpoint | seed {model_seed} | specialist {specialist}", flush=True)
@@ -316,15 +350,9 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
 
     validation_members = [result[0] for result in results]
     voting = "soft"
-    best_score = -1.0
-    for method in (("soft", "hard") if ensemble else ("soft",)):
-        predicted = vote(validation_members, method).argmax(dim=1).tolist()
-        score = f1_score(targets, predicted, labels=list(range(len(LABELS))),
-                         average="macro", zero_division=0)
-        print(f"{method} voting | validation macro-F1 {score:.4f}", flush=True)
-        if score > best_score:
-            best_score, voting = score, method
-    print(f"Selected {voting} voting", flush=True)
+    if ensemble:
+        voting = select_vote(validation_members, validation, targets, groups.loc[validation.index],
+                             review_path)
     validation_probs, test_probs, benchmark_probs = (
         vote([result[i] for result in results], voting) for i in range(3)
     )
@@ -350,10 +378,64 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
 def vote(probabilities, method):
     members = torch.stack(probabilities)
     average = members.mean(dim=0)
+    if method in ("cnn25", "cnn40"):
+        share = 0.25 if method == "cnn25" else 0.40
+        return members[0] * share + members[1:].mean(dim=0) * (1 - share)
     if method == "hard":
         counts = nn.functional.one_hot(members.argmax(dim=2), num_classes=len(LABELS)).sum(dim=0)
         average = average.masked_fill(counts != counts.amax(dim=1, keepdim=True), -torch.inf)
     return average
+
+
+def select_vote(probabilities, validation, targets, groups, review_path):
+    targets = torch.tensor(targets)
+    names = ("negative_cnn", "neutral_mlp", "positive_mlp")
+    individual = [probs.argmax(dim=1) for probs in probabilities]
+    for name, predictions in zip(names, individual):
+        print(name, classification_report(targets, predictions, labels=[0, 1, 2],
+                                          target_names=LABELS, digits=4, zero_division=0))
+    for i, j in ((0, 1), (0, 2), (1, 2)):
+        print(f"{names[i]} vs {names[j]}: {int((individual[i] != individual[j]).sum())}"
+              f"/{len(targets)} validation predictions differ")
+    cnn, neutral, positive = [pred == targets for pred in individual]
+    print(f"CNN alone correct: {int((cnn & ~neutral & ~positive).sum())}; "
+          f"both MLPs correct and CNN wrong: {int((~cnn & neutral & positive).sum())}")
+
+    rules = ("soft", "hard", "cnn25", "cnn40")
+    predictions = {rule: vote(probabilities, rule).argmax(dim=1) for rule in rules}
+
+    def score(rule, rows):
+        return f1_score(targets[rows], predictions[rule][rows], labels=[0, 1, 2],
+                        average="macro", zero_division=0)
+
+    # Each held fold is scored using a voting rule picked on the other folds.
+    # All rules use exactly the same three already-trained models.
+    folds = list(StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42)
+                 .split(validation, targets.numpy(), groups))
+    for rule in rules:
+        by_fold = [round(score(rule, held), 4) for _, held in folds]
+        print(f"{rule} validation macro-F1 {score(rule, slice(None)):.4f} | folds {by_fold}")
+    crossfit = torch.empty_like(targets)
+    for train, held in folds:
+        rule = max(rules, key=lambda r: score(r, train))
+        crossfit[held] = predictions[rule][held]
+    print(f"Cross-validated voting rule selection macro-F1 "
+          f"{f1_score(targets, crossfit, labels=[0, 1, 2], average='macro', zero_division=0):.4f}")
+    chosen = max(rules, key=lambda r: score(r, slice(None)))
+    selected = predictions[chosen]
+    review = validation[["id", "text", "label"]].copy()
+    for name, pred in zip(names, individual):
+        review[name] = [LABELS[i] for i in pred.tolist()]
+    review["ensemble"] = [LABELS[i] for i in selected.tolist()]
+    errors = review[((targets != selected) & (targets < 2) & (selected < 2)).numpy()]
+    print(f"Negative -> neutral: {int(((targets == 0) & (selected == 1)).sum())}; "
+          f"neutral -> negative: {int(((targets == 1) & (selected == 0)).sum())}")
+    if review_path is not None:
+        path = Path(review_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        errors.to_csv(path, index=False)
+        print(f"Saved {len(errors)} validation disagreements to {path}")
+    return chosen
 
 
 def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weights,
