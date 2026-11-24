@@ -1,6 +1,7 @@
 """Train a three-class sentiment classifier on the HW3 labeled dataset."""
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import html
 from pathlib import Path
@@ -212,7 +213,8 @@ def main():
 
 def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
-        checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None):
+        checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None,
+        sweep_path=None, tune_neutral=False):
     """Train BERT and return benchmark predictions and training histories."""
     if schedule not in ("linear", "cosine"):
         raise ValueError("Schedule must be linear or cosine.")
@@ -259,13 +261,17 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     # The previous Colab version hashed the entire script into its filenames.
     # Its training recipe is compatible only with the original mention handling.
     sources = [Path(__file__).read_bytes()]
-    if checkpoint_dir and not distinguish_mentions and any(checkpoint_dir.glob("*.pt")):
-        try:
-            old = subprocess.run(["git", "cat-file", "blob", "236a5a13c653087e41a9e8a79f8fad60aa780546"],
-                                 cwd=ROOT, capture_output=True, check=True).stdout
-            sources.append(old)
-        except (OSError, subprocess.CalledProcessError):
-            pass
+    if checkpoint_dir and any(checkpoint_dir.glob("*.pt")):
+        compatible = ["57eaa643d4bc977cf8ffee1496c1acb8e0fbe183"]
+        if not distinguish_mentions:
+            compatible.append("236a5a13c653087e41a9e8a79f8fad60aa780546")
+        for blob in compatible:
+            try:
+                old = subprocess.run(["git", "cat-file", "blob", blob], cwd=ROOT,
+                                     capture_output=True, check=True).stdout
+                sources.append(old)
+            except (OSError, subprocess.CalledProcessError):
+                continue
     data_bytes = (ROOT / "dataset" / "dataset.csv").read_bytes()
     run_key = repr((epochs, patience, batch_size, max_length, str(device),
                     train.index.tolist(), validation.index.tolist())).encode()
@@ -349,10 +355,10 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
                  for (_, label, _), result in zip(members, results)}
 
     validation_members = [result[0] for result in results]
-    voting = "soft"
+    voting = VotingRule("equal soft")
     if ensemble:
         voting = select_vote(validation_members, validation, targets, groups.loc[validation.index],
-                             review_path)
+                             review_path, sweep_path, tune_neutral)
     validation_probs, test_probs, benchmark_probs = (
         vote([result[i] for result in results], voting) for i in range(3)
     )
@@ -375,19 +381,28 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     return predictions, histories
 
 
-def vote(probabilities, method):
+@dataclass(frozen=True)
+class VotingRule:
+    name: str
+    weights: tuple = ()
+    neutral_multiplier: float = 1.0
+
+
+def vote(probabilities, rule):
     members = torch.stack(probabilities)
-    average = members.mean(dim=0)
-    if method in ("cnn25", "cnn40"):
-        share = 0.25 if method == "cnn25" else 0.40
-        return members[0] * share + members[1:].mean(dim=0) * (1 - share)
-    if method == "hard":
+    if rule.weights:
+        weights = members.new_tensor(rule.weights).view(-1, 1, 1)
+        scores = (members * weights).sum(dim=0)
+    else:
+        scores = members.mean(dim=0)
+    if rule.name == "hard":
         counts = nn.functional.one_hot(members.argmax(dim=2), num_classes=len(LABELS)).sum(dim=0)
-        average = average.masked_fill(counts != counts.amax(dim=1, keepdim=True), -torch.inf)
-    return average
+        scores = scores.masked_fill(counts != counts.amax(dim=1, keepdim=True), -torch.inf)
+    scores[:, LABEL_TO_ID["neutral"]] *= rule.neutral_multiplier
+    return scores
 
 
-def select_vote(probabilities, validation, targets, groups, review_path):
+def select_vote(probabilities, validation, targets, groups, review_path, sweep_path, tune_neutral):
     targets = torch.tensor(targets)
     names = ("negative_cnn", "neutral_mlp", "positive_mlp")
     individual = [probs.argmax(dim=1) for probs in probabilities]
@@ -401,28 +416,64 @@ def select_vote(probabilities, validation, targets, groups, review_path):
     print(f"CNN alone correct: {int((cnn & ~neutral & ~positive).sum())}; "
           f"both MLPs correct and CNN wrong: {int((~cnn & neutral & positive).sum())}")
 
-    rules = ("soft", "hard", "cnn25", "cnn40")
-    predictions = {rule: vote(probabilities, rule).argmax(dim=1) for rule in rules}
+    grid = [VotingRule("grid", (i / 10, j / 10, (10 - i - j) / 10))
+            for i in range(11) for j in range(11 - i)]
+    # Prefer the equal soft control on ties; among grid ties prefer balanced weights.
+    grid.sort(key=lambda rule: sum((w - 1 / 3) ** 2 for w in rule.weights))
+    rules = [VotingRule("equal soft"), VotingRule("hard"), *grid]
+    predictions = {}
+
+    def labels(rule):
+        if rule not in predictions:
+            predictions[rule] = vote(probabilities, rule).argmax(dim=1)
+        return predictions[rule]
 
     def score(rule, rows):
-        return f1_score(targets[rows], predictions[rule][rows], labels=[0, 1, 2],
+        return f1_score(targets[rows], labels(rule)[rows], labels=[0, 1, 2],
                         average="macro", zero_division=0)
 
-    # Each held fold is scored using a voting rule picked on the other folds.
-    # All rules use exactly the same three already-trained models.
+    def select(rows):
+        best = max(rules, key=lambda rule: score(rule, rows))
+        if not tune_neutral:
+            return best
+        # Keep 1.0 first so a tie preserves the unadjusted decision.
+        candidates = [VotingRule(best.name, best.weights, m) for m in (1., .95, 1.05, .90, 1.10)]
+        return max(candidates, key=lambda rule: score(rule, rows))
+
     folds = list(StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42)
                  .split(validation, targets.numpy(), groups))
-    for rule in rules:
-        by_fold = [round(score(rule, held), 4) for _, held in folds]
-        print(f"{rule} validation macro-F1 {score(rule, slice(None)):.4f} | folds {by_fold}")
     crossfit = torch.empty_like(targets)
-    for train, held in folds:
-        rule = max(rules, key=lambda r: score(r, train))
-        crossfit[held] = predictions[rule][held]
-    print(f"Cross-validated voting rule selection macro-F1 "
-          f"{f1_score(targets, crossfit, labels=[0, 1, 2], average='macro', zero_division=0):.4f}")
-    chosen = max(rules, key=lambda r: score(r, slice(None)))
-    selected = predictions[chosen]
+    for k, (train, held) in enumerate(folds, 1):
+        rule = select(train)
+        crossfit[held] = labels(rule)[held]
+        print(f"Fold {k} selected {rule} | held macro-F1 {score(rule, held):.4f}")
+    all_rows = slice(None)
+    crossfit_f1 = f1_score(targets, crossfit, labels=[0, 1, 2], average="macro", zero_division=0)
+    print(f"Grouped out-of-fold voting selection {crossfit_f1:.4f} | "
+          f"equal soft {score(rules[0], all_rows):.4f} | hard {score(rules[1], all_rows):.4f}")
+    chosen = select(all_rows)
+    selected = labels(chosen)
+    if sweep_path is not None:
+        records = []
+        report_rules = list(rules)
+        if tune_neutral:
+            report_rules.extend(VotingRule(chosen.name, chosen.weights, m) for m in (.90, .95, 1.05, 1.10))
+        for rule in report_rules:
+            predicted = labels(rule)
+            positive = predicted == LABEL_TO_ID["neutral"]
+            actual = targets == LABEL_TO_ID["neutral"]
+            correct = int((positive & actual).sum())
+            weights = rule.weights or ((1/3,) * 3 if rule.name == "equal soft" else (None,) * 3)
+            records.append(dict(rule=rule.name, cnn=weights[0], neutral_mlp=weights[1],
+                                positive_mlp=weights[2], multiplier=rule.neutral_multiplier,
+                                macro_f1=score(rule, all_rows), selected=rule == chosen,
+                                neutral_precision=correct / max(1, int(positive.sum())),
+                                neutral_recall=correct / max(1, int(actual.sum())),
+                                **{f"fold_{k}": score(rule, held)
+                                   for k, (_, held) in enumerate(folds, 1)}))
+        path = Path(sweep_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(records).to_csv(path, index=False)
     review = validation[["id", "text", "label"]].copy()
     for name, pred in zip(names, individual):
         review[name] = [LABELS[i] for i in pred.tolist()]
