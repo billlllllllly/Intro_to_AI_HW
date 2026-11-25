@@ -169,8 +169,10 @@ def main():
     parser.add_argument("--checkpoint-dir", type=Path, help="Reuse completed models from this directory.")
     parser.add_argument("--distinguish-mentions", action="store_true")
     parser.add_argument("--review-path", type=Path, help="Save validation neutral/negative disagreements here.")
-    parser.add_argument("--epochs", type=int, default=3, help="Maximum number of epochs.")
-    parser.add_argument("--patience", type=int, default=2, help="Stop after this many epochs without a new best validation macro-F1.")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
+    parser.add_argument("--select", choices=("last", "best-f1"), default="last",
+                        help="Keep the last epoch or select by validation macro-F1.")
+    parser.add_argument("--patience", type=int, default=2, help="Early-stopping patience for --select best-f1.")
     parser.add_argument("--class-weighting", choices=("sqrt", "inverse", "none"), default="sqrt",
                         help="Training loss weighting based on training split class frequencies.")
     parser.add_argument("--fgsm-epsilon", type=float, default=0.0,
@@ -190,7 +192,7 @@ def main():
 def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
         checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None,
-        split_file="splits.json"):
+        split_file="splits.json", select="last"):
     """Train BERT and return benchmark predictions and training histories."""
     if schedule not in ("linear", "cosine"):
         raise ValueError("Schedule must be linear or cosine.")
@@ -198,6 +200,8 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         checkpoint_dir = Path(checkpoint_dir)
     if not 0 <= fgsm_epsilon < float("inf"):
         raise ValueError("FGSM epsilon must be finite and nonnegative.")
+    if select not in ("last", "best-f1"):
+        raise ValueError("Epoch selection must be last or best-f1.")
     if patience < 1:
         raise ValueError("Patience must be positive.")
     if epochs < 1 or batch_size < 1 or not 3 <= max_length <= 512:
@@ -236,7 +240,7 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
                              train.index.tolist(), validation.index.tolist())).encode())
 
     def fit(model_seed, specialist, head_type):
-        key = (class_weighting, balanced_sampling, fgsm_epsilon, model_seed, specialist, head_type, schedule)
+        key = (class_weighting, balanced_sampling, fgsm_epsilon, model_seed, specialist, head_type, schedule, select)
         if distinguish_mentions:
             key += ("distinct_mentions",)
         checkpoint = None
@@ -280,7 +284,8 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         model, history = train_model(tokenizer, train_loader, val_loader, device,
                                      nn.CrossEntropyLoss(), weights, epochs=epochs,
                                      patience=patience, fgsm_epsilon=fgsm_epsilon, head_type=head_type,
-                                     encoder_lr=ENCODER_LR, head_lr=HEAD_LR, schedule=schedule)
+                                     encoder_lr=ENCODER_LR, head_lr=HEAD_LR, schedule=schedule,
+                                     select=select)
         val = predict_probabilities(model, val_loader, device)
         if checkpoint is not None:
             saved = {"model": {name: tensor.cpu() for name, tensor in model.state_dict().items()},
@@ -391,7 +396,12 @@ def report_members(probabilities, names, validation, targets, ensemble_probs, re
 
 
 def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weights,
-                *, epochs, patience, fgsm_epsilon, head_type, encoder_lr, head_lr, schedule):
+                *, epochs, patience, fgsm_epsilon, head_type, encoder_lr, head_lr,
+                schedule, select="last"):
+    """Train the model, accepting None for val_loader when validation is unavailable."""
+    if select not in ("last", "best-f1"):
+        raise ValueError("Epoch selection must be last or best-f1.")
+    keep_best = select == "best-f1" and val_loader is not None
     model = SentimentModel(len(tokenizer), head_type=head_type).to(device)
     from fold_training import optimizer_for
     optimizer = optimizer_for(model, encoder_lr, head_lr, layer_decay=0.9)
@@ -411,14 +421,19 @@ def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weig
             model, train_loader, loss_fn, device, optimizer, scheduler,
             class_weights, fgsm_epsilon,
         )
-        val_metrics = run_epoch(model, val_loader, loss_fn, device)
+        val_metrics = (float("nan"), float("nan"))
+        val_log = ""
+        if val_loader is not None:
+            val_metrics = run_epoch(model, val_loader, loss_fn, device)
+            val_log = f" | val loss {val_metrics[0]:.4f}, macro-F1 {val_metrics[1]:.4f}"
         history.append((train_metrics, val_metrics))
         print(
             f"Epoch {epoch}/{epochs} | "
-            f"train loss {train_metrics[0]:.4f}, macro-F1 {train_metrics[1]:.4f} | "
-            f"val loss {val_metrics[0]:.4f}, macro-F1 {val_metrics[1]:.4f}",
+            f"train loss {train_metrics[0]:.4f}, macro-F1 {train_metrics[1]:.4f}{val_log}",
             flush=True,
         )
+        if not keep_best:
+            continue
         if val_metrics[1] > best_f1:
             best_f1 = val_metrics[1]
             best_epoch = epoch
@@ -430,8 +445,9 @@ def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weig
             print(f"Early stopping after epoch {epoch}: validation macro-F1 stalled.")
             break
 
-    print(f"Best validation macro-F1 {best_f1:.4f} at epoch {best_epoch}.")
-    model.load_state_dict(best_state)
+    if keep_best:
+        print(f"Best validation macro-F1 {best_f1:.4f} at epoch {best_epoch}.")
+        model.load_state_dict(best_state)
     return model, history
 
 
