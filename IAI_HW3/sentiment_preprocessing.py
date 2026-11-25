@@ -8,6 +8,15 @@ COMPANY_TOKEN = "[CPY]"
 GMAIL_TOKEN = "[GMAIL]"
 
 
+EMOTICONS = (
+    (r"(?<!\w)(?:>:-?\(|-_-|:-?/)(?!\w)", " annoyed face "),
+    (r"(?<!\w)(?::'?-?[(\[]|=\(|T_T|;_;)(?!\w)", " sad face "),
+    (r"(?<!\w)<3(?!\w)", " heart "),
+    (r"(?<!\w)(?:[:=;]-?[)\]D]|\^_?\^)(?!\w)", " smiling face "),
+    (r"(?<!\w)[:=;]-?P(?!\w)", " playful face "),
+)
+
+
 def preprocess(text, clean=False, url_token=False, distinguish_mentions=False):
     if clean:
         text = html.unescape(text)
@@ -27,4 +36,9 @@ def preprocess(text, clean=False, url_token=False, distinguish_mentions=False):
     text = emoji.replace_emoji(
         text, replace=lambda symbol, data: " " + data["en"].strip(":").replace("_", " ") + " ",
     )
+    if clean:
+        for pattern, words in EMOTICONS:
+            text = re.sub(pattern, words, text)
+        text = re.sub(r"#(\w+)", lambda m: " " + re.sub(
+            r"(?<=[a-z0-9])(?=[A-Z])", " ", m.group(1)) + " ", text)
     return " ".join(text.split())

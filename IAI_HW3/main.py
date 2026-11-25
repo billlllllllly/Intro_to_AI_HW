@@ -4,7 +4,6 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-import subprocess
 from tempfile import NamedTemporaryFile
 
 from sentiment_preprocessing import COMPANY_TOKEN, GMAIL_TOKEN, preprocess
@@ -26,8 +25,8 @@ ROOT = Path(__file__).resolve().parent
 BASE_MODEL = "google-bert/bert-base-uncased"
 LABELS = ("negative", "neutral", "positive")
 LABEL_TO_ID = {label: index for index, label in enumerate(LABELS)}
-ENCODER_LR = 1e-5
-HEAD_LR = 5e-4
+ENCODER_LR = 2e-5
+HEAD_LR = 2e-4
 
 
 def has_content(text):
@@ -127,14 +126,14 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None, scheduler=None,
             if training:
                 objective = loss
                 if class_weights is not None:
-                    objective = nn.functional.cross_entropy(logits, labels, weight=class_weights)
+                    objective = nn.functional.cross_entropy(logits, labels, weight=class_weights, label_smoothing=0.05)
                 if embeddings is not None:
                     gradient, = torch.autograd.grad(objective, embeddings, retain_graph=True)
                     perturbation = fgsm_epsilon * gradient.sign()
                     perturbation = perturbation * inputs["attention_mask"].unsqueeze(-1)
                     adversarial_logits = model(inputs, embeddings + perturbation)
                     adversarial_loss = nn.functional.cross_entropy(
-                        adversarial_logits, labels, weight=class_weights,
+                        adversarial_logits, labels, weight=class_weights, label_smoothing=0.05,
                     )
                     objective = (objective + adversarial_loss) / 2
                 objective.backward()
@@ -169,7 +168,7 @@ def main():
     parser.add_argument("--checkpoint-dir", type=Path, help="Reuse completed models from this directory.")
     parser.add_argument("--distinguish-mentions", action="store_true")
     parser.add_argument("--review-path", type=Path, help="Save validation neutral/negative disagreements here.")
-    parser.add_argument("--epochs", type=int, default=5, help="Maximum number of epochs.")
+    parser.add_argument("--epochs", type=int, default=3, help="Maximum number of epochs.")
     parser.add_argument("--patience", type=int, default=2, help="Stop after this many epochs without a new best validation macro-F1.")
     parser.add_argument("--class-weighting", choices=("sqrt", "inverse", "none"), default="sqrt",
                         help="Training loss weighting based on training split class frequencies.")
@@ -185,7 +184,7 @@ def main():
     return run(**vars(parser.parse_args()))
 
 
-def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
+def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
         checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None,
         sweep_path=None, tune_neutral=False):
@@ -232,29 +231,11 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     counts = train["label"].value_counts().reindex(LABELS)
     if checkpoint_dir is not None:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    # The previous Colab version hashed the entire script into its filenames.
-    # Its training recipe is compatible only with the original mention handling.
-    sources = [Path(__file__).read_bytes()]
-    if checkpoint_dir and any(checkpoint_dir.glob("*.pt")):
-        compatible = ["57eaa643d4bc977cf8ffee1496c1acb8e0fbe183"]
-        if not distinguish_mentions:
-            compatible.append("236a5a13c653087e41a9e8a79f8fad60aa780546")
-        for blob in compatible:
-            try:
-                old = subprocess.run(["git", "cat-file", "blob", blob], cwd=ROOT,
-                                     capture_output=True, check=True).stdout
-                sources.append(old)
-            except (OSError, subprocess.CalledProcessError):
-                continue
-    data_bytes = (ROOT / "dataset" / "dataset.csv").read_bytes()
-    run_key = repr((epochs, patience, batch_size, max_length, str(device),
-                    train.index.tolist(), validation.index.tolist())).encode()
-    fingerprints = []
-    for source in sources:
-        digest = hashlib.sha256(source)
-        digest.update(data_bytes)
-        digest.update(run_key)
-        fingerprints.append(digest)
+    fingerprint = hashlib.sha256(Path(__file__).read_bytes())
+    fingerprint.update((ROOT / "sentiment_preprocessing.py").read_bytes())
+    fingerprint.update((ROOT / "dataset/dataset.csv").read_bytes())
+    fingerprint.update(repr((epochs, patience, batch_size, max_length, str(device),
+                             train.index.tolist(), validation.index.tolist())).encode())
 
     def fit(model_seed, specialist, head_type):
         key = (class_weighting, balanced_sampling, fgsm_epsilon, model_seed, specialist, head_type, schedule)
@@ -262,18 +243,15 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
             key += ("distinct_mentions",)
         checkpoint = None
         if checkpoint_dir is not None:
-            paths = []
-            for fingerprint in fingerprints:
-                digest = fingerprint.copy()
-                digest.update(repr(key).encode())
-                paths.append(checkpoint_dir / (digest.hexdigest() + ".pt"))
-            checkpoint = next((path for path in paths if path.is_file()), paths[0])
+            digest = fingerprint.copy()
+            digest.update(repr(key).encode())
+            checkpoint = checkpoint_dir / (digest.hexdigest() + ".pt")
         torch.manual_seed(model_seed)
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
         tokens = [COMPANY_TOKEN, GMAIL_TOKEN] + (["[OTHER_USER]"] if distinguish_mentions else [])
         tokenizer.add_special_tokens({"additional_special_tokens": tokens})
         options = dict(tokenizer=tokenizer, batch_size=batch_size, max_length=max_length,
-                       distinguish_mentions=distinguish_mentions)
+                       distinguish_mentions=distinguish_mentions, clean=True)
         val_loader = make_loader(validation, **options)
         if checkpoint is not None and checkpoint.is_file():
             print(f"Reusing {head_type.upper()} checkpoint | seed {model_seed} | specialist {specialist}", flush=True)
@@ -341,7 +319,9 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
                                 target_names=LABELS, digits=4, zero_division=0))
     print(confusion_matrix(targets, predicted, labels=list(range(len(LABELS)))))
     for name, frame, scores in (
-        ("Validation", validation, validation_probs), ("Held-out test", test, test_probs)
+        ("Validation", validation, validation_probs), ("Held-out test", test, test_probs),
+        ("Pooled validation + test", pd.concat([validation, test]),
+         torch.cat([validation_probs, test_probs]))
     ):
         score = f1_score(
             frame["label"].map(LABEL_TO_ID), scores.argmax(dim=1).tolist(),
@@ -352,6 +332,7 @@ def run(*, epochs=5, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     predictions = benchmark[["id"]].assign(
         label=[LABELS[i] for i in benchmark_probs.argmax(dim=1).tolist()]
     )
+    predictions.attrs["pooled_macro_f1"] = score
     return predictions, histories
 
 
@@ -466,13 +447,8 @@ def select_vote(probabilities, validation, targets, groups, review_path, sweep_p
 def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weights,
                 *, epochs, patience, fgsm_epsilon, head_type, encoder_lr, head_lr, schedule):
     model = SentimentModel(len(tokenizer), head_type=head_type).to(device)
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": model.encoder.parameters(), "lr": encoder_lr},
-            {"params": model.head.parameters(), "lr": head_lr},
-        ],
-        weight_decay=0.01,
-    )
+    from fold_training import optimizer_for
+    optimizer = optimizer_for(model, encoder_lr, head_lr, layer_decay=0.9)
     total_steps = epochs * len(train_loader)
     make_scheduler = (get_cosine_schedule_with_warmup if schedule == "cosine"
                       else get_linear_schedule_with_warmup)
