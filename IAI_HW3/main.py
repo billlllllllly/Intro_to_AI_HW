@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from sentiment_preprocessing import COMPANY_TOKEN, GMAIL_TOKEN, preprocess
+from splits import load_or_create_splits, split_key
 import pandas as pd
 import torch
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
@@ -181,13 +182,15 @@ def main():
                         help="Train one CNN specialist and two MLP specialists.")
     parser.add_argument("--schedule", choices=("linear", "cosine"), default="linear")
     parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--split-file", type=Path, default="splits.json",
+                        help="Load or create frozen split indices at this path.")
     return run(**vars(parser.parse_args()))
 
 
 def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
         checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None,
-        sweep_path=None, tune_neutral=False):
+        sweep_path=None, tune_neutral=False, split_file="splits.json"):
     """Train BERT and return benchmark predictions and training histories."""
     if schedule not in ("linear", "cosine"):
         raise ValueError("Schedule must be linear or cosine.")
@@ -209,22 +212,18 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     if set(data["label"]) != set(LABELS):
         raise ValueError(f"Expected exactly these sentiment labels: {LABELS}")
 
-    groups = data["text"].map(lambda text: preprocess(text).casefold())
-    outer_split = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
-    train_ids, held_out_ids = next(outer_split.split(data, data["label"], groups))
-    train, held_out = data.iloc[train_ids], data.iloc[held_out_ids]
-    inner_split = StratifiedGroupKFold(n_splits=2, shuffle=True, random_state=seed)
-    val_ids, test_ids = next(
-        inner_split.split(held_out, held_out["label"], groups.iloc[held_out_ids])
+    train_pos, val_pos, test_pos = load_or_create_splits(
+        data, ROOT / "dataset/dataset.csv", ROOT / split_file,
     )
-    validation, test = held_out.iloc[val_ids], held_out.iloc[test_ids]
+    train, validation, test = data.iloc[train_pos], data.iloc[val_pos], data.iloc[test_pos]
+    groups = data["text"].map(split_key)
     keep = train["text"].map(has_content)
     removed = train.loc[~keep, "label"].value_counts().reindex(LABELS, fill_value=0)
     train = train.loc[keep]
     if set(train["label"]) != set(LABELS):
         raise ValueError("Filtering nearly empty posts left a training class without examples.")
     print(f"Removed nearly empty training posts by class: {removed.to_dict()}")
-    print(f"Device: {device} | train: {len(train)} | validation: {len(validation)} | test: {len(test)}", flush=True)
+    print(f"Device: {device} | train: {len(train_pos)} | validation: {len(validation)} | test: {len(test)}", flush=True)
 
     benchmark = pd.read_csv(ROOT / "dataset" / "benchmark.csv", keep_default_na=False)
     targets = validation["label"].map(LABEL_TO_ID).tolist()
