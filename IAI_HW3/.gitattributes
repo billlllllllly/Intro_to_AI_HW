@@ -1,0 +1,2 @@
+# Keep the frozen split's exact dataset checksum stable across checkouts.
+/dataset/dataset.csv text eol=lf
