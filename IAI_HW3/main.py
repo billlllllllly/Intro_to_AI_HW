@@ -1,11 +1,12 @@
 """Train a three-class sentiment classifier on the HW3 labeled dataset."""
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 from itertools import combinations
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Optional
 
 from sentiment_preprocessing import COMPANY_TOKEN, GMAIL_TOKEN, preprocess
 from splits import load_or_create_splits
@@ -28,6 +29,36 @@ LABELS = ("negative", "neutral", "positive")
 LABEL_TO_ID = {label: index for index, label in enumerate(LABELS)}
 ENCODER_LR = 2e-5
 HEAD_LR = 2e-4
+
+
+@dataclass(frozen=True)
+class MemberSpec:
+    name: str
+    seed: int
+    head: str = "mlp"
+    base_model: str = BASE_MODEL
+    boost_class: Optional[str] = None
+    subsample: float = 1.0
+
+
+PRESETS = {
+    "legacy": [
+        MemberSpec("negative_cnn", 42, "cnn", boost_class="negative"),
+        MemberSpec("neutral_mlp", 43, "mlp", boost_class="neutral"),
+        MemberSpec("positive_mlp", 44, "mlp", boost_class="positive"),
+    ],
+    "diverse": [
+        MemberSpec("cls_mlp", 42, "mlp"),
+        MemberSpec("mean_pool", 43, "mean"),
+        MemberSpec("cls_mean", 44, "clsmean"),
+    ],
+    # Opt in only if the assignment allows the cased BERT-base checkpoint.
+    "diverse-cased": [
+        MemberSpec("cls_mlp", 42, "mlp"),
+        MemberSpec("mean_pool", 43, "mean"),
+        MemberSpec("cased_cls_mean", 44, "clsmean", base_model="google-bert/bert-base-cased"),
+    ],
+}
 
 
 def has_content(text):
@@ -59,13 +90,45 @@ class CNNHead(nn.Module):
         return self.classifier(self.dropout(torch.cat(features, dim=1)))
 
 
-class SentimentModel(nn.Module):
-    def __init__(self, vocab_size, head_type="mlp"):
+def masked_mean(hidden, attention_mask):
+    mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+    return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+
+
+class MeanPoolHead(nn.Module):
+    def __init__(self, hidden_size, dropout=0.1):
         super().__init__()
-        self.encoder = BertModel.from_pretrained(BASE_MODEL, add_pooling_layer=False)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_size, len(LABELS))
+
+    def forward(self, hidden, attention_mask):
+        return self.classifier(self.dropout(masked_mean(hidden, attention_mask)))
+
+
+class ClsMeanHead(nn.Module):
+    def __init__(self, hidden_size, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(2 * hidden_size, len(LABELS))
+
+    def forward(self, hidden, attention_mask):
+        pooled = torch.cat([hidden[:, 0], masked_mean(hidden, attention_mask)], dim=-1)
+        return self.classifier(self.dropout(pooled))
+
+
+class SentimentModel(nn.Module):
+    def __init__(self, vocab_size, head_type="mlp", base_model=BASE_MODEL):
+        super().__init__()
+        self.encoder = BertModel.from_pretrained(base_model, add_pooling_layer=False)
         self.encoder.resize_token_embeddings(vocab_size)
         if head_type == "cnn":
             self.head = CNNHead(self.encoder.config.hidden_size)
+            return
+        if head_type == "mean":
+            self.head = MeanPoolHead(self.encoder.config.hidden_size)
+            return
+        if head_type == "clsmean":
+            self.head = ClsMeanHead(self.encoder.config.hidden_size)
             return
         self.head = nn.Sequential(
             nn.Linear(self.encoder.config.hidden_size, 128),
@@ -82,7 +145,7 @@ class SentimentModel(nn.Module):
             inputs = {name: tensor for name, tensor in inputs.items() if name != "input_ids"}
             inputs["inputs_embeds"] = embeddings
         hidden = self.encoder(**inputs).last_hidden_state
-        if isinstance(self.head, CNNHead):
+        if isinstance(self.head, (CNNHead, MeanPoolHead, ClsMeanHead)):
             return self.head(hidden, inputs["attention_mask"])
         return self.head(hidden[:, 0])
 
@@ -181,7 +244,11 @@ def main():
     parser.add_argument("--balanced-sampling", action="store_true",
                         help="Sample training examples inversely to class frequency.")
     parser.add_argument("--ensemble", action="store_true",
-                        help="Train one CNN specialist and two MLP specialists.")
+                        help="Train the three members of the selected preset.")
+    parser.add_argument("--preset", choices=PRESETS, default="legacy",
+                        help="Ensemble member preset. Use diverse-cased only if permitted.")
+    parser.add_argument("--subsample", type=float,
+                        help="Override the stratified training fraction for every member.")
     parser.add_argument("--schedule", choices=("linear", "cosine"), default="linear")
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--split-file", type=Path, default="splits.json",
@@ -192,7 +259,7 @@ def main():
 def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
         checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None,
-        split_file="splits.json", select="last"):
+        split_file="splits.json", select="last", preset="legacy", subsample=None):
     """Train BERT and return benchmark predictions and training histories."""
     if schedule not in ("linear", "cosine"):
         raise ValueError("Schedule must be linear or cosine.")
@@ -202,6 +269,10 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         raise ValueError("FGSM epsilon must be finite and nonnegative.")
     if select not in ("last", "best-f1"):
         raise ValueError("Epoch selection must be last or best-f1.")
+    if preset not in PRESETS:
+        raise ValueError(f"Unknown ensemble preset: {preset}")
+    if subsample is not None and not 0 < subsample <= 1:
+        raise ValueError("Subsample must be greater than 0 and at most 1.")
     if patience < 1:
         raise ValueError("Patience must be positive.")
     if epochs < 1 or batch_size < 1 or not 3 <= max_length <= 512:
@@ -230,91 +301,99 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
 
     benchmark = pd.read_csv(ROOT / "dataset" / "benchmark.csv", keep_default_na=False)
     targets = validation["label"].map(LABEL_TO_ID).tolist()
-    counts = train["label"].value_counts().reindex(LABELS)
     if checkpoint_dir is not None:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
     fingerprint = hashlib.sha256(Path(__file__).read_bytes())
     fingerprint.update((ROOT / "sentiment_preprocessing.py").read_bytes())
     fingerprint.update((ROOT / "dataset/dataset.csv").read_bytes())
     fingerprint.update(repr((epochs, patience, batch_size, max_length, str(device),
-                             train.index.tolist(), validation.index.tolist())).encode())
+                             distinguish_mentions)).encode())
 
-    def fit(model_seed, specialist, head_type):
-        key = (class_weighting, balanced_sampling, fgsm_epsilon, model_seed, specialist, head_type, schedule, select)
-        if distinguish_mentions:
-            key += ("distinct_mentions",)
+    def fit(spec, frame, final=False):
+        key = repr((class_weighting, balanced_sampling, fgsm_epsilon, schedule, select, final, spec))
         checkpoint = None
         if checkpoint_dir is not None:
             digest = fingerprint.copy()
-            digest.update(repr(key).encode())
+            digest.update(repr((frame.index.tolist(), None if final else validation.index.tolist())).encode())
+            digest.update(key.encode())
             checkpoint = checkpoint_dir / (digest.hexdigest() + ".pt")
-        torch.manual_seed(model_seed)
-        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+
+        torch.manual_seed(spec.seed)
+        tokenizer = AutoTokenizer.from_pretrained(spec.base_model)
         tokens = [COMPANY_TOKEN, GMAIL_TOKEN] + (["[OTHER_USER]"] if distinguish_mentions else [])
         tokenizer.add_special_tokens({"additional_special_tokens": tokens})
         options = dict(tokenizer=tokenizer, batch_size=batch_size, max_length=max_length,
                        distinguish_mentions=distinguish_mentions, clean=True)
-        val_loader = make_loader(validation, **options)
+
         if checkpoint is not None and checkpoint.is_file():
-            print(f"Reusing {head_type.upper()} checkpoint | seed {model_seed} | specialist {specialist}", flush=True)
+            print(f"Reusing checkpoint | {spec} | final fit {final}", flush=True)
             saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-            model = SentimentModel(len(tokenizer), head_type=head_type)
+            model = SentimentModel(len(tokenizer), head_type=spec.head, base_model=spec.base_model)
             model.load_state_dict(saved["model"])
             model.to(device)
-            return (saved["validation"],
-                    predict_probabilities(model, make_loader(test, **options), device),
-                    predict_probabilities(model, make_loader(benchmark, **options), device),
-                    saved["history"])
+            val_probs, history = saved["validation"], saved["history"]
+        else:
+            member_train = frame
+            if spec.subsample < 1:
+                member_train = frame.groupby("label", group_keys=False).sample(
+                    frac=spec.subsample, random_state=spec.seed,
+                )
+            counts = member_train["label"].value_counts().reindex(LABELS, fill_value=0)
+            if counts.eq(0).any():
+                raise ValueError(f"Training data for {spec.name} must include every sentiment class.")
+            weights = torch.ones(len(LABELS), device=device)
+            if class_weighting != "none":
+                weights = torch.tensor(len(member_train) / (len(LABELS) * counts.to_numpy()),
+                                       dtype=torch.float32, device=device)
+                if class_weighting == "sqrt":
+                    weights = weights.sqrt()
+            if spec.boost_class is not None:
+                weights[LABEL_TO_ID[spec.boost_class]] *= 2
+            sampler = None
+            if balanced_sampling:
+                sampler = WeightedRandomSampler(member_train["label"].map(1 / counts).to_numpy(),
+                                                len(member_train), replacement=True)
+            train_loader = make_loader(member_train, **options, shuffle=True, sampler=sampler)
+            val_loader = None if final else make_loader(validation, **options)
+            print(f"Training {spec} | final fit {final} | encoder LR {ENCODER_LR:g} | "
+                  f"head LR {HEAD_LR:g} | schedule {schedule}", flush=True)
+            model, history = train_model(
+                tokenizer, train_loader, val_loader, device, nn.CrossEntropyLoss(), weights,
+                epochs=epochs, patience=patience, fgsm_epsilon=fgsm_epsilon, head_type=spec.head,
+                encoder_lr=ENCODER_LR, head_lr=HEAD_LR, schedule=schedule, select=select,
+                base_model=spec.base_model,
+            )
+            val_probs = None if final else predict_probabilities(model, val_loader, device)
+            if checkpoint is not None:
+                saved = {"model": {name: tensor.cpu() for name, tensor in model.state_dict().items()},
+                         "validation": val_probs, "history": history}
+                with NamedTemporaryFile(dir=checkpoint_dir, suffix=".tmp", delete=False) as file:
+                    temporary = Path(file.name)
+                try:
+                    torch.save(saved, temporary)
+                    temporary.replace(checkpoint)
+                finally:
+                    temporary.unlink(missing_ok=True)
 
-        sampler = None
-        if balanced_sampling:
-            sampler = WeightedRandomSampler(train["label"].map(1 / counts).to_numpy(),
-                                            len(train), replacement=True)
-        train_loader = make_loader(train, **options, shuffle=True, sampler=sampler)
-        weights = torch.ones(len(LABELS), device=device)
-        if class_weighting != "none":
-            weights = torch.tensor(len(train) / (len(LABELS) * counts.to_numpy()),
-                                   dtype=torch.float32, device=device)
-            if class_weighting == "sqrt":
-                weights = weights.sqrt()
-        if specialist is not None:
-            weights[LABEL_TO_ID[specialist]] *= 2
-        print(f"Training {head_type.upper()} head | encoder LR {ENCODER_LR:g} | head LR {HEAD_LR:g} | "
-              f"schedule {schedule} | seed {model_seed} | specialist {specialist}", flush=True)
-        model, history = train_model(tokenizer, train_loader, val_loader, device,
-                                     nn.CrossEntropyLoss(), weights, epochs=epochs,
-                                     patience=patience, fgsm_epsilon=fgsm_epsilon, head_type=head_type,
-                                     encoder_lr=ENCODER_LR, head_lr=HEAD_LR, schedule=schedule,
-                                     select=select)
-        val = predict_probabilities(model, val_loader, device)
-        if checkpoint is not None:
-            saved = {"model": {name: tensor.cpu() for name, tensor in model.state_dict().items()},
-                     "validation": val, "history": history}
-            with NamedTemporaryFile(dir=checkpoint_dir, suffix=".tmp", delete=False) as file:
-                temporary = Path(file.name)
-            try:
-                torch.save(saved, temporary)
-                temporary.replace(checkpoint)
-            finally:
-                temporary.unlink(missing_ok=True)
-        return (val, predict_probabilities(model, make_loader(test, **options), device),
-                predict_probabilities(model, make_loader(benchmark, **options), device), history)
+        test_probs = None if final else predict_probabilities(model, make_loader(test, **options), device)
+        benchmark_probs = predict_probabilities(model, make_loader(benchmark, **options), device)
+        return val_probs, test_probs, benchmark_probs, history
 
+    members = PRESETS[preset] if ensemble else [MemberSpec("bert", seed)]
     if ensemble:
-        members = [(seed, "negative", "cnn"), (seed + 1, "neutral", "mlp"),
-                   (seed + 2, "positive", "mlp")]
-    else:
-        members = [(seed, None, "mlp")]
-    results = [fit(*member) for member in members]
-    histories = {label or "bert": result[3]
-                 for (_, label, _), result in zip(members, results)}
+        assert len(members) == 3, "assignment allows at most three models in the ensemble"
+    if subsample is not None:
+        members = [replace(spec, subsample=subsample) for spec in members]
+
+    results = [fit(spec, train) for spec in members]
+    histories = {spec.name: result[3] for spec, result in zip(members, results)}
 
     voting = VotingRule("equal soft")
     validation_probs, test_probs, benchmark_probs = (
         vote([result[i] for result in results], voting) for i in range(3)
     )
     if ensemble:
-        names = [f"{label}_{head}" for _, label, head in members]
+        names = [spec.name for spec in members]
         report_members([result[0] for result in results], names, validation, targets,
                        validation_probs, review_path)
     predicted = validation_probs.argmax(dim=1).tolist()
@@ -397,12 +476,12 @@ def report_members(probabilities, names, validation, targets, ensemble_probs, re
 
 def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weights,
                 *, epochs, patience, fgsm_epsilon, head_type, encoder_lr, head_lr,
-                schedule, select="last"):
+                schedule, select="last", base_model=BASE_MODEL):
     """Train the model, accepting None for val_loader when validation is unavailable."""
     if select not in ("last", "best-f1"):
         raise ValueError("Epoch selection must be last or best-f1.")
     keep_best = select == "best-f1" and val_loader is not None
-    model = SentimentModel(len(tokenizer), head_type=head_type).to(device)
+    model = SentimentModel(len(tokenizer), head_type=head_type, base_model=base_model).to(device)
     from fold_training import optimizer_for
     optimizer = optimizer_for(model, encoder_lr, head_lr, layer_decay=0.9)
     total_steps = epochs * len(train_loader)
