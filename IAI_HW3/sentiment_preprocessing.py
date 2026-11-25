@@ -41,4 +41,5 @@ def preprocess(text, clean=False, url_token=False, distinguish_mentions=False):
             text = re.sub(pattern, words, text)
         text = re.sub(r"#(\w+)", lambda m: " " + re.sub(
             r"(?<=[a-z0-9])(?=[A-Z])", " ", m.group(1)) + " ", text)
+        text = re.sub(r"([A-Za-z])\1{2,}", r"\1\1", text)
     return " ".join(text.split())
