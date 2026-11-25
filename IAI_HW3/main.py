@@ -1,13 +1,16 @@
 """Train a three-class sentiment classifier on the HW3 labeled dataset."""
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 from itertools import combinations
+import json
 from pathlib import Path
+import subprocess
 from tempfile import NamedTemporaryFile
 from typing import Optional
 
+import numpy as np
 from sentiment_preprocessing import COMPANY_TOKEN, GMAIL_TOKEN, preprocess
 from splits import load_or_create_splits
 import pandas as pd
@@ -253,14 +256,16 @@ def main():
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--split-file", type=Path, default="splits.json",
                         help="Load or create frozen split indices at this path.")
+    parser.add_argument("--run-dir", type=Path, help="Save run configuration, probabilities, and predictions.")
     return run(**vars(parser.parse_args()))
 
 
 def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
         checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None,
-        split_file="splits.json", select="last", preset="legacy", subsample=None):
+        split_file="splits.json", select="last", preset="legacy", subsample=None, run_dir=None):
     """Train BERT and return benchmark predictions and training histories."""
+    run_args = locals().copy()
     if schedule not in ("linear", "cosine"):
         raise ValueError("Schedule must be linear or cosine.")
     if checkpoint_dir is not None:
@@ -287,9 +292,8 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     if set(data["label"]) != set(LABELS):
         raise ValueError(f"Expected exactly these sentiment labels: {LABELS}")
 
-    train_pos, val_pos, test_pos = load_or_create_splits(
-        data, ROOT / "dataset/dataset.csv", ROOT / split_file,
-    )
+    split_path = ROOT / split_file
+    train_pos, val_pos, test_pos = load_or_create_splits(data, ROOT / "dataset/dataset.csv", split_path)
     train, validation, test = data.iloc[train_pos], data.iloc[val_pos], data.iloc[test_pos]
     keep = train["text"].map(has_content)
     removed = train.loc[~keep, "label"].value_counts().reindex(LABELS, fill_value=0)
@@ -309,6 +313,8 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     fingerprint.update(repr((epochs, patience, batch_size, max_length, str(device),
                              distinguish_mentions)).encode())
 
+    effective_class_priors = {}
+
     def fit(spec, frame, final=False):
         key = repr((class_weighting, balanced_sampling, fgsm_epsilon, schedule, select, final, spec))
         checkpoint = None
@@ -317,6 +323,26 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
             digest.update(repr((frame.index.tolist(), None if final else validation.index.tolist())).encode())
             digest.update(key.encode())
             checkpoint = checkpoint_dir / (digest.hexdigest() + ".pt")
+
+        member_train = frame
+        if spec.subsample < 1:
+            member_train = frame.groupby("label", group_keys=False).sample(
+                frac=spec.subsample, random_state=spec.seed,
+            )
+        counts = member_train["label"].value_counts().reindex(LABELS, fill_value=0)
+        if counts.eq(0).any():
+            raise ValueError(f"Training data for {spec.name} must include every sentiment class.")
+        weights = torch.ones(len(LABELS), device=device)
+        if class_weighting != "none":
+            weights = torch.tensor(len(member_train) / (len(LABELS) * counts.to_numpy()),
+                                   dtype=torch.float32, device=device)
+            if class_weighting == "sqrt":
+                weights = weights.sqrt()
+        if spec.boost_class is not None:
+            weights[LABEL_TO_ID[spec.boost_class]] *= 2
+        if run_dir is not None:
+            prior = counts.to_numpy() * weights.cpu().numpy()
+            effective_class_priors[spec.name] = (prior / prior.sum()).tolist()
 
         torch.manual_seed(spec.seed)
         tokenizer = AutoTokenizer.from_pretrained(spec.base_model)
@@ -333,22 +359,6 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
             model.to(device)
             val_probs, history = saved["validation"], saved["history"]
         else:
-            member_train = frame
-            if spec.subsample < 1:
-                member_train = frame.groupby("label", group_keys=False).sample(
-                    frac=spec.subsample, random_state=spec.seed,
-                )
-            counts = member_train["label"].value_counts().reindex(LABELS, fill_value=0)
-            if counts.eq(0).any():
-                raise ValueError(f"Training data for {spec.name} must include every sentiment class.")
-            weights = torch.ones(len(LABELS), device=device)
-            if class_weighting != "none":
-                weights = torch.tensor(len(member_train) / (len(LABELS) * counts.to_numpy()),
-                                       dtype=torch.float32, device=device)
-                if class_weighting == "sqrt":
-                    weights = weights.sqrt()
-            if spec.boost_class is not None:
-                weights[LABEL_TO_ID[spec.boost_class]] *= 2
             sampler = None
             if balanced_sampling:
                 sampler = WeightedRandomSampler(member_train["label"].map(1 / counts).to_numpy(),
@@ -415,6 +425,34 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         label=[LABELS[i] for i in benchmark_probs.argmax(dim=1).tolist()]
     )
     predictions.attrs["pooled_macro_f1"] = score
+    if run_dir is not None:
+        run_path = Path(run_dir)
+        run_path.mkdir(parents=True, exist_ok=True)
+        try:
+            git_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            git_commit = ""
+        config = {
+            "args": run_args,
+            "members": [asdict(spec) for spec in members],
+            "git_commit": git_commit,
+            "splits_sha256": hashlib.sha256(split_path.read_bytes()).hexdigest(),
+            "effective_class_priors": effective_class_priors,
+        }
+        arrays = {}
+        for index, (name, frame) in enumerate((("val", validation), ("test", test), ("benchmark", benchmark))):
+            ids = frame["id"].to_numpy()
+            arrays[f"{name}_ids"] = ids.astype(str) if ids.dtype.hasobject else ids
+            arrays[f"{name}_member_probs"] = torch.stack([result[index] for result in results]).numpy()
+            if "label" in frame:
+                arrays[f"{name}_labels"] = frame["label"].map(LABEL_TO_ID).to_numpy(dtype=np.int64)
+        np.savez(run_path / "probs.npz", **arrays)
+        predictions.to_csv(run_path / "predictions.csv", index=False)
+        (run_path / "config.json").write_text(
+            json.dumps(config, indent=2, default=str) + "\n", encoding="utf-8",
+        )
     return predictions, histories
 
 
