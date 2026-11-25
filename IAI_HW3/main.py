@@ -257,13 +257,16 @@ def main():
     parser.add_argument("--split-file", type=Path, default="splits.json",
                         help="Load or create frozen split indices at this path.")
     parser.add_argument("--run-dir", type=Path, help="Save run configuration, probabilities, and predictions.")
+    parser.add_argument("--final-fit", action="store_true",
+                        help="Refit on the labeled train, validation, and test rows for submission.")
     return run(**vars(parser.parse_args()))
 
 
 def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
         checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None,
-        split_file="splits.json", select="last", preset="legacy", subsample=None, run_dir=None):
+        split_file="splits.json", select="last", preset="legacy", subsample=None, run_dir=None,
+        final_fit=False):
     """Train BERT and return benchmark predictions and training histories."""
     run_args = locals().copy()
     if schedule not in ("linear", "cosine"):
@@ -314,6 +317,7 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
                              distinguish_mentions)).encode())
 
     effective_class_priors = {}
+    final_effective_class_priors = {}
 
     def fit(spec, frame, final=False):
         key = repr((class_weighting, balanced_sampling, fgsm_epsilon, schedule, select, final, spec))
@@ -342,7 +346,8 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
             weights[LABEL_TO_ID[spec.boost_class]] *= 2
         if run_dir is not None:
             prior = counts.to_numpy() * weights.cpu().numpy()
-            effective_class_priors[spec.name] = (prior / prior.sum()).tolist()
+            priors = final_effective_class_priors if final else effective_class_priors
+            priors[spec.name] = (prior / prior.sum()).tolist()
 
         torch.manual_seed(spec.seed)
         tokenizer = AutoTokenizer.from_pretrained(spec.base_model)
@@ -425,6 +430,26 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         label=[LABELS[i] for i in benchmark_probs.argmax(dim=1).tolist()]
     )
     predictions.attrs["pooled_macro_f1"] = score
+    if final_fit:
+        full = pd.concat([train, validation, test])
+        final_results = [fit(spec, full, final=True) for spec in members]
+        final_benchmark = vote([result[2] for result in final_results], voting)
+        final_labels = final_benchmark.argmax(dim=1)
+        final_predictions = benchmark[["id"]].assign(
+            label=[LABELS[i] for i in final_labels.tolist()],
+        )
+        final_predictions.attrs["pooled_macro_f1"] = score
+        final_predictions.attrs["evaluation_predictions"] = predictions
+
+        agreement = (final_labels == benchmark_probs.argmax(dim=1)).float().mean().item()
+        print(f"Final-fit vs evaluation-pass benchmark agreement: {agreement:.3f}")
+        print("Final-fit predicted class shares:", {
+            name: round((final_labels == i).float().mean().item(), 3)
+            for i, name in enumerate(LABELS)
+        })
+        if agreement < 0.93:
+            print("Warning: benchmark agreement below 0.93 suggests an unstable recipe.")
+
     if run_dir is not None:
         run_path = Path(run_dir)
         run_path.mkdir(parents=True, exist_ok=True)
@@ -448,12 +473,16 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
             arrays[f"{name}_member_probs"] = torch.stack([result[index] for result in results]).numpy()
             if "label" in frame:
                 arrays[f"{name}_labels"] = frame["label"].map(LABEL_TO_ID).to_numpy(dtype=np.int64)
+        if final_fit:
+            config["final_effective_class_priors"] = final_effective_class_priors
+            arrays["final_benchmark_member_probs"] = torch.stack([result[2] for result in final_results]).numpy()
+            final_predictions.to_csv(run_path / "predictions_final.csv", index=False)
         np.savez(run_path / "probs.npz", **arrays)
         predictions.to_csv(run_path / "predictions.csv", index=False)
         (run_path / "config.json").write_text(
             json.dumps(config, indent=2, default=str) + "\n", encoding="utf-8",
         )
-    return predictions, histories
+    return (final_predictions if final_fit else predictions), histories
 
 
 @dataclass(frozen=True)
