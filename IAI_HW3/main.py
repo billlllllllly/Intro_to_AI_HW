@@ -3,15 +3,15 @@
 import argparse
 from dataclasses import dataclass
 import hashlib
+from itertools import combinations
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from sentiment_preprocessing import COMPANY_TOKEN, GMAIL_TOKEN, preprocess
-from splits import load_or_create_splits, split_key
+from splits import load_or_create_splits
 import pandas as pd
 import torch
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import StratifiedGroupKFold
 from torch import nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from transformers import (
@@ -190,7 +190,7 @@ def main():
 def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         batch_size=16, balanced_sampling=False, ensemble=False, max_length=128,
         checkpoint_dir=None, schedule="linear", distinguish_mentions=False, review_path=None,
-        sweep_path=None, tune_neutral=False, split_file="splits.json"):
+        split_file="splits.json"):
     """Train BERT and return benchmark predictions and training histories."""
     if schedule not in ("linear", "cosine"):
         raise ValueError("Schedule must be linear or cosine.")
@@ -216,7 +216,6 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
         data, ROOT / "dataset/dataset.csv", ROOT / split_file,
     )
     train, validation, test = data.iloc[train_pos], data.iloc[val_pos], data.iloc[test_pos]
-    groups = data["text"].map(split_key)
     keep = train["text"].map(has_content)
     removed = train.loc[~keep, "label"].value_counts().reindex(LABELS, fill_value=0)
     train = train.loc[keep]
@@ -305,14 +304,14 @@ def run(*, epochs=3, patience=2, class_weighting="sqrt", fgsm_epsilon=0.0,
     histories = {label or "bert": result[3]
                  for (_, label, _), result in zip(members, results)}
 
-    validation_members = [result[0] for result in results]
     voting = VotingRule("equal soft")
-    if ensemble:
-        voting = select_vote(validation_members, validation, targets, groups.loc[validation.index],
-                             review_path, sweep_path, tune_neutral)
     validation_probs, test_probs, benchmark_probs = (
         vote([result[i] for result in results], voting) for i in range(3)
     )
+    if ensemble:
+        names = [f"{label}_{head}" for _, label, head in members]
+        report_members([result[0] for result in results], names, validation, targets,
+                       validation_probs, review_path)
     predicted = validation_probs.argmax(dim=1).tolist()
     print(classification_report(targets, predicted, labels=list(range(len(LABELS))),
                                 target_names=LABELS, digits=4, zero_division=0))
@@ -356,91 +355,39 @@ def vote(probabilities, rule):
     return scores
 
 
-def select_vote(probabilities, validation, targets, groups, review_path, sweep_path, tune_neutral):
+def report_members(probabilities, names, validation, targets, ensemble_probs, review_path):
     targets = torch.tensor(targets)
-    names = ("negative_cnn", "neutral_mlp", "positive_mlp")
     individual = [probs.argmax(dim=1) for probs in probabilities]
     for name, predictions in zip(names, individual):
-        print(name, classification_report(targets, predictions, labels=[0, 1, 2],
+        print(name, classification_report(targets, predictions, labels=list(range(len(LABELS))),
                                           target_names=LABELS, digits=4, zero_division=0))
-    for i, j in ((0, 1), (0, 2), (1, 2)):
+    for i, j in combinations(range(len(names)), 2):
         print(f"{names[i]} vs {names[j]}: {int((individual[i] != individual[j]).sum())}"
               f"/{len(targets)} validation predictions differ")
-    cnn, neutral, positive = [pred == targets for pred in individual]
-    print(f"CNN alone correct: {int((cnn & ~neutral & ~positive).sum())}; "
-          f"both MLPs correct and CNN wrong: {int((~cnn & neutral & positive).sum())}")
 
-    grid = [VotingRule("grid", (i / 10, j / 10, (10 - i - j) / 10))
-            for i in range(11) for j in range(11 - i)]
-    # Prefer the equal soft control on ties; among grid ties prefer balanced weights.
-    grid.sort(key=lambda rule: sum((w - 1 / 3) ** 2 for w in rule.weights))
-    rules = [VotingRule("equal soft"), VotingRule("hard"), *grid]
-    predictions = {}
+    correct = torch.stack(individual) == targets
+    correct_count = correct.sum(dim=0)
+    for name, member_correct in zip(names, correct):
+        alone = (member_correct & (correct_count == 1)).sum().item()
+        others = (~member_correct & (correct_count == len(names) - 1)).sum().item()
+        print(f"{name} alone correct: {alone} | both others correct and {name} wrong: {others}")
 
-    def labels(rule):
-        if rule not in predictions:
-            predictions[rule] = vote(probabilities, rule).argmax(dim=1)
-        return predictions[rule]
-
-    def score(rule, rows):
-        return f1_score(targets[rows], labels(rule)[rows], labels=[0, 1, 2],
-                        average="macro", zero_division=0)
-
-    def select(rows):
-        best = max(rules, key=lambda rule: score(rule, rows))
-        if not tune_neutral:
-            return best
-        # Keep 1.0 first so a tie preserves the unadjusted decision.
-        candidates = [VotingRule(best.name, best.weights, m) for m in (1., .95, 1.05, .90, 1.10)]
-        return max(candidates, key=lambda rule: score(rule, rows))
-
-    folds = list(StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42)
-                 .split(validation, targets.numpy(), groups))
-    crossfit = torch.empty_like(targets)
-    for k, (train, held) in enumerate(folds, 1):
-        rule = select(train)
-        crossfit[held] = labels(rule)[held]
-        print(f"Fold {k} selected {rule} | held macro-F1 {score(rule, held):.4f}")
-    all_rows = slice(None)
-    crossfit_f1 = f1_score(targets, crossfit, labels=[0, 1, 2], average="macro", zero_division=0)
-    print(f"Grouped out-of-fold voting selection {crossfit_f1:.4f} | "
-          f"equal soft {score(rules[0], all_rows):.4f} | hard {score(rules[1], all_rows):.4f}")
-    chosen = select(all_rows)
-    selected = labels(chosen)
-    if sweep_path is not None:
-        records = []
-        report_rules = list(rules)
-        if tune_neutral:
-            report_rules.extend(VotingRule(chosen.name, chosen.weights, m) for m in (.90, .95, 1.05, 1.10))
-        for rule in report_rules:
-            predicted = labels(rule)
-            positive = predicted == LABEL_TO_ID["neutral"]
-            actual = targets == LABEL_TO_ID["neutral"]
-            correct = int((positive & actual).sum())
-            weights = rule.weights or ((1/3,) * 3 if rule.name == "equal soft" else (None,) * 3)
-            records.append(dict(rule=rule.name, cnn=weights[0], neutral_mlp=weights[1],
-                                positive_mlp=weights[2], multiplier=rule.neutral_multiplier,
-                                macro_f1=score(rule, all_rows), selected=rule == chosen,
-                                neutral_precision=correct / max(1, int(positive.sum())),
-                                neutral_recall=correct / max(1, int(actual.sum())),
-                                **{f"fold_{k}": score(rule, held)
-                                   for k, (_, held) in enumerate(folds, 1)}))
-        path = Path(sweep_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(records).to_csv(path, index=False)
-    review = validation[["id", "text", "label"]].copy()
-    for name, pred in zip(names, individual):
-        review[name] = [LABELS[i] for i in pred.tolist()]
-    review["ensemble"] = [LABELS[i] for i in selected.tolist()]
-    errors = review[((targets != selected) & (targets < 2) & (selected < 2)).numpy()]
-    print(f"Negative -> neutral: {int(((targets == 0) & (selected == 1)).sum())}; "
-          f"neutral -> negative: {int(((targets == 1) & (selected == 0)).sum())}")
+    selected = ensemble_probs.argmax(dim=1)
+    negative, neutral = LABEL_TO_ID["negative"], LABEL_TO_ID["neutral"]
+    negative_to_neutral = (targets == negative) & (selected == neutral)
+    neutral_to_negative = (targets == neutral) & (selected == negative)
+    print(f"Negative -> neutral: {negative_to_neutral.sum().item()} | "
+          f"neutral -> negative: {neutral_to_negative.sum().item()}")
     if review_path is not None:
+        errors = negative_to_neutral | neutral_to_negative
+        review = validation.loc[errors.numpy(), ["id", "text", "label"]].copy()
+        for name, predictions in zip(names, individual):
+            review[name] = [LABELS[i] for i in predictions[errors].tolist()]
+        review["ensemble"] = [LABELS[i] for i in selected[errors].tolist()]
         path = Path(review_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        errors.to_csv(path, index=False)
-        print(f"Saved {len(errors)} validation disagreements to {path}")
-    return chosen
+        review.to_csv(path, index=False)
+        print(f"Saved {len(review)} validation disagreements to {path}")
 
 
 def train_model(tokenizer, train_loader, val_loader, device, loss_fn, class_weights,
