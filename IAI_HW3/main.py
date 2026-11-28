@@ -1139,6 +1139,78 @@ def save_evaluation(data, indices, scored, run_dir, name):
     print(json.dumps(report, indent=2, ensure_ascii=True))
 
 
+def review_negative_neutral(data, run_dir, predictions_path):
+    """Audit the final ensemble's zero-offset decisions using saved labeled predictions."""
+    with predictions_path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        columns = set(reader.fieldnames or ())
+        prediction_column = "two_readings" if "two_readings" in columns else "baseline"
+        if not {"id", "gold", prediction_column} <= columns:
+            raise ValueError("Use heldout_predictions.csv or the offset experiment's holdout_probabilities.csv.")
+        saved = list(reader)
+    ids = [row["id"] for row in saved]
+    if not ids or len(set(ids)) != len(ids):
+        raise ValueError("Saved holdout predictions must have one row per unique ID.")
+
+    manifest_path = run_dir / "splits.json"
+    if manifest_path.is_file():
+        manifest = read_json(manifest_path)
+        if data.digest != manifest["dataset_sha256"] or set(ids) != set(manifest["test_ids"]):
+            raise ValueError("The course data or prediction IDs differ from the run's holdout manifest.")
+
+    index_by_id = {key: i for i, key in enumerate(data.ids)}
+    pair = ("negative", "neutral")
+    directions = (("negative", "neutral"), ("neutral", "negative"))
+    counts = Counter()
+    examples = {(gold, predicted): [] for gold in pair for predicted in pair}
+    errors = 0
+    for row in saved:
+        key, gold, predicted = row["id"], row["gold"], row[prediction_column]
+        if key not in index_by_id or predicted not in LABELS:
+            raise ValueError(f"Unknown course ID or predicted label for row {key!r}.")
+        index = index_by_id[key]
+        if gold != LABELS[data.labels[index]]:
+            raise ValueError(f"Saved gold label disagrees with the course CSV for ID {key}.")
+        text = data.raw[index]
+        question = "?" in _replace_urls(_canonical_tweet(text), "")
+        counts[gold, predicted, question] += 1
+        errors += gold != predicted
+        if (gold, predicted) in examples and (gold != predicted or question):
+            marker = "?" if question else "-"
+            examples[gold, predicted].append(f"{key} | {marker} | {' '.join(text.split())}")
+
+    crossed = sum(len(examples[a, b]) for a, b in directions)
+    summary = [
+        "Negative–neutral holdout review (original ensemble, zero offsets)",
+        f"Predictions: {predictions_path.name} / {prediction_column}",
+        f"Holdout rows: {len(saved)} | All errors: {errors} | Negative–neutral errors: {crossed}",
+        "Question = a question mark in the tweet after URLs are removed.",
+        "",
+        "Gold -> predicted | subset | crossed / all gold rows in subset",
+    ]
+    for gold, predicted in directions:
+        for question, name in ((True, "question"), (False, "no question mark")):
+            n = counts[gold, predicted, question]
+            total = sum(counts[gold, label, question] for label in LABELS)
+            rate = f"{100 * n / total:.1f}%" if total else "n/a"
+            summary.append(f"{gold} -> {predicted} | {name} | {n}/{total} ({rate})")
+
+    lines = summary + [
+        "", "Read the question errors alongside the correctly classified questions below.",
+        "For each, look for a factual request, expressed dissatisfaction, or both.",
+        "ID | question marker | original tweet (line breaks collapsed)",
+    ]
+    for gold, predicted in (*directions, ("negative", "negative"), ("neutral", "neutral")):
+        items = examples[gold, predicted]
+        kind = "errors" if gold != predicted else "correctly classified questions"
+        lines += ["", f"{gold} -> {predicted} | {kind} ({len(items)})", *items]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output = run_dir / "negative_neutral_review.txt"
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(summary))
+    print(f"Review saved to {output}")
+
+
 def infer_benchmark(data_dir, run_dir, output, device):
     benchmark = read_tweets(data_dir / "benchmark.csv", labeled=False)
     probabilities, _, _, _ = score_system(benchmark.raw, benchmark.normalized, run_dir, device)
@@ -1258,6 +1330,7 @@ def main():
         "prepare": "Save the grouped holdout, stopping, and calibration IDs.",
         "train": "Train and calibrate three independent BERTs for the chosen outer fold.",
         "evaluate": "Compare all stages on the run's labeled held-out rows.",
+        "review-errors": "Review negative–neutral errors and correctly classified questions from saved holdout predictions.",
         "oof": "Repeat the full recipe for all ten outer folds.",
         "predict": "Generate and validate the benchmark submission CSV.",
         "package": "Create the coursework ZIP and verify its reloaded predictions.",
@@ -1268,7 +1341,9 @@ def main():
         command.add_argument("--data-dir", type=Path, default=ROOT / "dataset")
         if name in {"prepare", "train"}:
             command.add_argument("--outer-fold", type=int, choices=range(1, 11), default=2)
-        if name != "prepare":
+        if name == "review-errors":
+            command.add_argument("--predictions", type=Path, help="Defaults to heldout_predictions.csv in the run directory.")
+        if name not in {"prepare", "review-errors"}:
             command.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
         if name == "oof":
             command.add_argument("--reuse-holdout", type=Path, help="Reuse a completed, matching outer fold 2 run.")
@@ -1287,6 +1362,12 @@ def main():
         return
 
     data = read_tweets(args.data_dir / "dataset.csv", labeled=True)
+    if args.command == "review-errors":
+        predictions = args.predictions or args.run_dir / "heldout_predictions.csv"
+        if not predictions.is_file():
+            raise FileNotFoundError(f"Missing {predictions}. Supply a saved holdout prediction CSV using --predictions.")
+        review_negative_neutral(data, args.run_dir, predictions)
+        return
     if args.command == "oof":
         run_oof(data, args.run_dir, choose_device(args.device), args.reuse_holdout)
         return
